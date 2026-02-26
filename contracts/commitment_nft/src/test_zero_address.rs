@@ -21,9 +21,10 @@ fn test_nft_mint_to_zero_address_fails() {
     let client = CommitmentNftContractClient::new(&env, &contract_id);
 
     let zero_address = generate_zero_address(&env);
+    let dummy_token_id = 0i128;
 
-    // Trying the 2-argument mint: (to, token_id)
-    client.mint(&zero_address, &0i128);
+    // Fixed: Passing both owner and token_id
+    client.mint(&zero_address, &dummy_token_id);
 }
 
 #[test]
@@ -39,8 +40,9 @@ fn test_nft_transfer_to_zero_address_fails() {
     let zero_address = generate_zero_address(&env);
     let token_id = 1i128;
 
+    // Setup: Mint to valid sender first
     client.mint(&sender, &token_id);
 
-    // Standard transfer: (from, to, token_id)
+    // Attempt transfer: (from, to, token_id)
     client.transfer(&sender, &zero_address, &token_id);
 }
