@@ -1,15 +1,18 @@
 #![cfg(test)]
 extern crate std;
 
+use crate::*;
 use soroban_sdk::{Address, Env, String};
-use crate::{CommitmentNftContract, CommitmentNftContractClient};
 
 fn generate_zero_address(env: &Env) -> Address {
-    Address::from_string(&String::from_str(env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"))
+    Address::from_string(&String::from_str(
+        env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ))
 }
 
 #[test]
-#[should_panic] 
+#[should_panic]
 fn test_nft_mint_to_zero_address_fails() {
     let env = Env::default();
     env.mock_all_auths();
@@ -19,12 +22,13 @@ fn test_nft_mint_to_zero_address_fails() {
 
     let zero_address = generate_zero_address(&env);
 
-    // Standard mint call
-    client.mint(&zero_address); 
+    // In this contract, mint requires both the owner and a token_id
+    let dummy_token_id = 0i128;
+    client.mint(&zero_address, &dummy_token_id);
 }
 
 #[test]
-#[should_panic] 
+#[should_panic]
 fn test_nft_transfer_to_zero_address_fails() {
     let env = Env::default();
     env.mock_all_auths();
@@ -34,12 +38,11 @@ fn test_nft_transfer_to_zero_address_fails() {
 
     let sender = Address::generate(&env);
     let zero_address = generate_zero_address(&env);
+    let token_id = 1i128;
 
-    // Setup: Mint to valid sender
-    client.mint(&sender);
-    
-    // Use a standard i128 token_id
-    let token_id: i128 = 0; 
+    // Setup: Mint to valid sender first
+    client.mint(&sender, &token_id);
 
+    // Attempt transfer: (from, to, token_id)
     client.transfer(&sender, &zero_address, &token_id);
 }
