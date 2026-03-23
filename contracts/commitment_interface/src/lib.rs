@@ -161,6 +161,10 @@ mod tests {
             .join("\n")
     }
 
+    fn squish(source: &str) -> String {
+        source.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     #[test]
     fn interface_version_tracks_current_abi_generation() {
         assert_eq!(INTERFACE_VERSION, 2);
@@ -200,9 +204,11 @@ mod tests {
 
     #[test]
     fn live_core_source_contains_expected_interface_signatures() {
+        let squished = squish(CORE_SOURCE);
+
         for signature in [
             "pub fn initialize(e: Env, admin: Address, nft_contract: Address)",
-            "pub fn create_commitment(e: Env, owner: Address, amount: i128, asset_address: Address, rules: CommitmentRules) -> String",
+            "pub fn create_commitment( e: Env, owner: Address, amount: i128, asset_address: Address, rules: CommitmentRules, ) -> String",
             "pub fn get_commitment(e: Env, commitment_id: String) -> Commitment",
             "pub fn get_owner_commitments(e: Env, owner: Address) -> Vec<String>",
             "pub fn get_total_commitments(e: Env) -> u64",
@@ -210,7 +216,7 @@ mod tests {
             "pub fn early_exit(e: Env, commitment_id: String, caller: Address)",
         ] {
             assert!(
-                CORE_SOURCE.contains(signature),
+                squished.contains(&squish(signature)),
                 "missing live-core signature: {signature}"
             );
         }
