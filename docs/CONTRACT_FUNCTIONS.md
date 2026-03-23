@@ -23,6 +23,23 @@ This document summarizes public entry points for each contract and their access 
 | set_rate_limit(caller, function, window, max_calls)                   | Configure rate limits.                           | Admin only.                               | Uses shared RateLimiter.                           |
 | set_rate_limit_exempt(caller, address, exempt)                        | Configure rate limit exemption.                  | Admin only.                               | Uses shared RateLimiter.                           |
 
+## commitment_interface
+
+`commitment_interface` is an ABI-only crate. It should mirror the live
+`commitment_core` commitment schema and a narrow set of production entrypoints.
+CI drift tests compare its source-defined types and expected signatures against
+`commitment_core` and `attestation_engine`.
+
+| Function                                                            | Summary                                      | Access control            | Notes                                                                    |
+| ------------------------------------------------------------------- | -------------------------------------------- | ------------------------- | ------------------------------------------------------------------------ |
+| initialize(admin, nft_contract) -> Result                           | Initialize admin and linked NFT contract.    | Interface only.           | Live core contract is single-use; no state exists in this crate.         |
+| create_commitment(owner, amount, asset_address, rules) -> Result<String> | Create a commitment and return string id.    | Interface only.           | Mirrors live `commitment_core` types, including `CommitmentRules`.       |
+| get_commitment(commitment_id) -> Result<Commitment>                 | Fetch the canonical commitment record.       | View in live contract.    | `Commitment` shape is drift-checked against `commitment_core`.           |
+| get_owner_commitments(owner) -> Result<Vec<String>>                 | List commitment ids owned by an address.     | View in live contract.    | Used by UIs and indexers.                                                |
+| get_total_commitments() -> Result<u64>                              | Read the total commitment counter.           | View in live contract.    | Counter is stored by the live core contract.                             |
+| settle(commitment_id) -> Result                                     | Settle an expired commitment.                | Mutating in live contract | Live implementation performs token and NFT cross-contract interactions.  |
+| early_exit(commitment_id, caller) -> Result                         | Exit a commitment early with penalty logic.  | Mutating in live contract | Live implementation must enforce caller auth and overflow-safe math.     |
+
 ## commitment_nft
 
 | Function                                                                                                                                       | Summary                            | Access control      | Notes                                       |

@@ -1,25 +1,33 @@
 #![no_std]
+//! Interface-only ABI definitions for the live commitment contracts.
+//!
+//! This crate intentionally contains no storage or business logic. It exists to
+//! give downstream callers and generated bindings a stable contract surface that
+//! mirrors the production `commitment_core` data model.
+
+extern crate alloc;
 
 pub mod error;
 pub mod types;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, String, Symbol, Vec};
 
 use crate::error::Error;
-use crate::types::CommitmentSpec;
+use crate::types::{Commitment, CommitmentRules};
 
 /// =======================
 /// Interface Metadata
 /// =======================
 
-pub const INTERFACE_VERSION: u32 = 1;
+pub const INTERFACE_VERSION: u32 = 2;
 
 /// =======================
 /// Events
 /// =======================
 
 pub const COMMITMENT_CREATED: Symbol = symbol_short!("created");
-pub const COMMITMENT_REVOKED: Symbol = symbol_short!("revoked");
+pub const COMMITMENT_SETTLED: Symbol = symbol_short!("settled");
+pub const COMMITMENT_EXITED: Symbol = symbol_short!("exited");
 
 /// =======================
 /// Interface Contract
@@ -30,23 +38,193 @@ pub struct CommitmentInterface;
 
 #[contractimpl]
 impl CommitmentInterface {
-    /// Initialize the commitment system
-    pub fn initialize(_env: Env, _admin: Address) -> Result<(), Error> {
+    /// Initialize the commitment system.
+    ///
+    /// # Arguments
+    /// * `admin` - Address that controls privileged configuration.
+    /// * `nft_contract` - Contract that mints and settles commitment NFTs.
+    ///
+    /// # Errors
+    /// Interface-only crate; callers should expect the live implementation to
+    /// reject re-initialization and invalid addresses.
+    ///
+    /// # Security
+    /// Live implementations must protect this entrypoint so initialization is
+    /// single-use and cannot be front-run into an unsafe admin assignment.
+    pub fn initialize(_env: Env, _admin: Address, _nft_contract: Address) -> Result<(), Error> {
         unimplemented!("interface only")
     }
 
-    /// Create a new commitment
-    pub fn create_commitment(_env: Env, _spec: CommitmentSpec) -> Result<u64, Error> {
+    /// Create a new commitment.
+    ///
+    /// # Arguments
+    /// * `owner` - Beneficial owner of the commitment.
+    /// * `amount` - Initial amount to lock.
+    /// * `asset_address` - Token contract for the committed asset.
+    /// * `rules` - Commitment policy and risk configuration.
+    ///
+    /// # Errors
+    /// Live implementations may reject invalid amounts, invalid rules,
+    /// insufficient balance, or unauthorized state transitions.
+    ///
+    /// # Security
+    /// Production contracts must validate caller trust boundaries, require auth
+    /// where ownership is asserted, and guard all external transfer/mint flows
+    /// against reentrancy.
+    pub fn create_commitment(
+        _env: Env,
+        _owner: Address,
+        _amount: i128,
+        _asset_address: Address,
+        _rules: CommitmentRules,
+    ) -> Result<String, Error> {
         unimplemented!("interface only")
     }
 
-    /// Fetch an existing commitment
-    pub fn get_commitment(_env: Env, _id: u64) -> Result<CommitmentSpec, Error> {
+    /// Fetch an existing commitment by its on-chain identifier.
+    pub fn get_commitment(_env: Env, _commitment_id: String) -> Result<Commitment, Error> {
         unimplemented!("interface only")
     }
 
-    /// Revoke a commitment
-    pub fn revoke_commitment(_env: Env, _id: u64) -> Result<(), Error> {
+    /// List commitment ids owned by the supplied address.
+    pub fn get_owner_commitments(_env: Env, _owner: Address) -> Result<Vec<String>, Error> {
         unimplemented!("interface only")
+    }
+
+    /// Return the aggregate number of commitments created so far.
+    pub fn get_total_commitments(_env: Env) -> Result<u64, Error> {
+        unimplemented!("interface only")
+    }
+
+    /// Settle an expired commitment.
+    ///
+    /// # Security
+    /// Live implementations mutate storage and perform token/NFT cross-contract
+    /// calls. They must use checks-effects-interactions and reentrancy guards.
+    pub fn settle(_env: Env, _commitment_id: String) -> Result<(), Error> {
+        unimplemented!("interface only")
+    }
+
+    /// Exit a commitment early on behalf of its owner.
+    ///
+    /// # Security
+    /// Live implementations must enforce owner authorization before any value
+    /// transfer and must apply penalty arithmetic with overflow-safe helpers.
+    pub fn early_exit(_env: Env, _commitment_id: String, _caller: Address) -> Result<(), Error> {
+        unimplemented!("interface only")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::INTERFACE_VERSION;
+    use alloc::{string::{String, ToString}, vec::Vec};
+
+    const INTERFACE_TYPES: &str = include_str!("types.rs");
+    const CORE_SOURCE: &str = include_str!("../../commitment_core/src/lib.rs");
+    const ATTESTATION_SOURCE: &str = include_str!("../../attestation_engine/src/lib.rs");
+
+    fn extract_block(source: &str, marker: &str) -> String {
+        let start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing marker: {marker}"));
+        let rest = &source[start..];
+        let open = rest
+            .find('{')
+            .unwrap_or_else(|| panic!("missing opening brace for: {marker}"));
+        let mut depth = 0usize;
+        let mut end_index = None;
+
+        for (offset, ch) in rest[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_index = Some(open + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        rest[..end_index.unwrap_or_else(|| panic!("unclosed block for: {marker}"))].to_string()
+    }
+
+    fn normalize(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or("").trim())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn squish(source: &str) -> String {
+        source.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn interface_version_tracks_current_abi_generation() {
+        assert_eq!(INTERFACE_VERSION, 2);
+    }
+
+    #[test]
+    fn commitment_rules_source_matches_commitment_core() {
+        assert_eq!(
+            normalize(&extract_block(INTERFACE_TYPES, "pub struct CommitmentRules {")),
+            normalize(&extract_block(CORE_SOURCE, "pub struct CommitmentRules {"))
+        );
+    }
+
+    #[test]
+    fn commitment_rules_source_matches_attestation_engine() {
+        assert_eq!(
+            normalize(&extract_block(INTERFACE_TYPES, "pub struct CommitmentRules {")),
+            normalize(&extract_block(ATTESTATION_SOURCE, "pub struct CommitmentRules {"))
+        );
+    }
+
+    #[test]
+    fn commitment_source_matches_commitment_core() {
+        assert_eq!(
+            normalize(&extract_block(INTERFACE_TYPES, "pub struct Commitment {")),
+            normalize(&extract_block(CORE_SOURCE, "pub struct Commitment {"))
+        );
+    }
+
+    #[test]
+    fn commitment_source_matches_attestation_engine() {
+        assert_eq!(
+            normalize(&extract_block(INTERFACE_TYPES, "pub struct Commitment {")),
+            normalize(&extract_block(ATTESTATION_SOURCE, "pub struct Commitment {"))
+        );
+    }
+
+    #[test]
+    fn live_core_source_contains_expected_interface_signatures() {
+        let squished = squish(CORE_SOURCE);
+
+        for signature in [
+            "pub fn initialize(e: Env, admin: Address, nft_contract: Address)",
+            "pub fn create_commitment( e: Env, owner: Address, amount: i128, asset_address: Address, rules: CommitmentRules, ) -> String",
+            "pub fn get_commitment(e: Env, commitment_id: String) -> Commitment",
+            "pub fn get_owner_commitments(e: Env, owner: Address) -> Vec<String>",
+            "pub fn get_total_commitments(e: Env) -> u64",
+            "pub fn settle(e: Env, commitment_id: String)",
+            "pub fn early_exit(e: Env, commitment_id: String, caller: Address)",
+        ] {
+            assert!(
+                squished.contains(&squish(signature)),
+                "missing live-core signature: {signature}"
+            );
+        }
+    }
+
+    #[test]
+    fn attestation_engine_reuses_the_same_commitment_types() {
+        assert!(ATTESTATION_SOURCE.contains("pub struct CommitmentRules"));
+        assert!(ATTESTATION_SOURCE.contains("pub struct Commitment"));
     }
 }

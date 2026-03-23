@@ -100,6 +100,11 @@ jobs:
           cargo test --workspace
           echo "✓ Unit tests passed"
 
+      - name: Drift check commitment interface
+        run: |
+          cargo test -p commitment_interface
+          echo "✓ Commitment interface drift checks passed"
+
       - name: Run integration tests
         run: |
           # Run integration tests from their own directory (separate from workspace)
