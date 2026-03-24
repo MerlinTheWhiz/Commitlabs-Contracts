@@ -103,6 +103,32 @@ CI drift tests compare its source-defined types and expected signatures against
 | set_rate_limit(admin, function, window, max_calls) -> Result                   | Configure rate limits.                  | Admin require_auth.  | Uses shared RateLimiter.                  |
 | set_rate_limit_exempt(admin, address, exempt) -> Result                        | Configure rate limit exemption.         | Admin require_auth.  | Uses shared RateLimiter.                  |
 
+## price_oracle
+
+| Function                                               | Summary                                          | Access control            | Notes                                                                          |
+| ------------------------------------------------------ | ------------------------------------------------ | ------------------------- | ------------------------------------------------------------------------------ |
+| initialize(admin) -> Result                            | Set admin and default staleness window.          | None (single-use).        | Initializes whitelist authority and versioned config.                          |
+| add_oracle(caller, oracle_address) -> Result           | Add a trusted price publisher.                   | Admin require_auth.       | Whitelisted oracle can overwrite the latest price for any asset it updates.    |
+| remove_oracle(caller, oracle_address) -> Result        | Remove a trusted price publisher.                | Admin require_auth.       | Prevents further updates from that address.                                    |
+| is_oracle_whitelisted(address) -> bool                 | Check whitelist membership.                      | View.                     | Reads the admin-managed trust list.                                            |
+| set_price(caller, asset, price, decimals) -> Result    | Publish latest price for an asset.               | Oracle require_auth.      | Validates non-negative price; does not aggregate or reconcile multiple feeds.  |
+| get_price(asset) -> PriceData                          | Read the raw latest price snapshot.              | View.                     | Returns zeroed `PriceData` if unset; does not enforce freshness.               |
+| get_price_valid(asset, max_staleness_override) -> Result<PriceData> | Read a fresh price snapshot or fail. | View.                     | Rejects stale and future-dated data; preferred for security-sensitive reads.   |
+| set_max_staleness(caller, seconds) -> Result           | Update default freshness window.                 | Admin require_auth.       | Tunes rejection threshold for delayed oracle updates.                          |
+| get_max_staleness() -> u64                             | Read default freshness window.                   | View.                     | Used when `get_price_valid` has no override.                                   |
+| get_admin() -> Address                                 | Read oracle admin.                               | View.                     | Returns the current whitelist/config authority.                                |
+| set_admin(caller, new_admin) -> Result                 | Transfer oracle admin authority.                 | Admin require_auth.       | Transfers control over whitelist and configuration.                            |
+| upgrade(caller, new_wasm_hash) -> Result               | Upgrade contract code.                           | Admin require_auth.       | Validates non-zero WASM hash.                                                  |
+| migrate(caller, from_version) -> Result                | Migrate legacy storage to current version.       | Admin require_auth.       | Replays are blocked once current version is installed.                         |
+
+### price_oracle manipulation-resistance notes
+
+- `price_oracle` is a trusted-publisher registry, not an on-chain price discovery engine.
+- A whitelisted oracle may unilaterally replace the latest price for an asset.
+- Freshness protection is enforced by `get_price_valid`; integrators should prefer it over `get_price`.
+- Downstream contracts should pick staleness windows that fit the asset’s liquidity and their own liquidation or settlement risk.
+- Threat model reference: `docs/THREAT_MODEL.md#price-oracle-manipulation-resistance-assumptions`
+
 ## commitment_nft - Edge Cases and Error Codes
 
 ### Transfer Function Edge Cases

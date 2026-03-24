@@ -188,6 +188,61 @@ fn test_get_price_valid_override_staleness() {
 }
 
 #[test]
+fn test_get_price_valid_accepts_exact_staleness_boundary() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let admin = Address::generate(&e);
+    let oracle = Address::generate(&e);
+    let asset = Address::generate(&e);
+    let contract_id = e.register_contract(None, PriceOracleContract);
+    let client = PriceOracleContractClient::new(&e, &contract_id);
+
+    e.as_contract(&contract_id, || {
+        PriceOracleContract::initialize(e.clone(), admin.clone()).unwrap();
+        PriceOracleContract::add_oracle(e.clone(), admin.clone(), oracle.clone()).unwrap();
+    });
+
+    client.set_price(&oracle, &asset, &42_00000000, &8);
+    e.ledger().with_mut(|li| {
+        li.timestamp += 3600;
+    });
+
+    let data = client.get_price_valid(&asset, &None);
+    assert_eq!(data.price, 42_00000000);
+    assert_eq!(data.decimals, 8);
+}
+
+#[test]
+fn test_get_price_valid_rejects_future_dated_price() {
+    let e = Env::default();
+    let admin = Address::generate(&e);
+    let asset = Address::generate(&e);
+    let contract_id = e.register_contract(None, PriceOracleContract);
+    let client = PriceOracleContractClient::new(&e, &contract_id);
+
+    e.as_contract(&contract_id, || {
+        PriceOracleContract::initialize(e.clone(), admin.clone()).unwrap();
+        e.storage().instance().set(
+            &DataKey::Price(asset.clone()),
+            &PriceData {
+                price: 1234,
+                updated_at: 500,
+                decimals: 8,
+            },
+        );
+    });
+
+    e.ledger().with_mut(|li| {
+        li.timestamp = 499;
+    });
+
+    assert_eq!(
+        client.try_get_price_valid(&asset, &None),
+        Err(Ok(OracleError::StalePrice))
+    );
+}
+
+#[test]
 fn test_set_max_staleness() {
     let e = Env::default();
     e.mock_all_auths();

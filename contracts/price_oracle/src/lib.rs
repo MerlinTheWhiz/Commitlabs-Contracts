@@ -4,6 +4,18 @@
 //!
 //! Provides whitelisted price feeds with validation, time-based validity (staleness),
 //! and optional fallback. Used for value calculation, drawdown, compliance, and fees.
+//!
+//! # Manipulation resistance assumptions
+//! This contract is intentionally a push-based oracle registry, not an on-chain price
+//! discovery mechanism. It assumes:
+//! - oracle addresses added by the admin are trusted to publish honest prices
+//! - consumers enforce freshness through `get_price_valid` and `max_staleness_seconds`
+//! - a single whitelisted oracle update can replace the latest value for an asset
+//! - there is no medianization, TWAP, quorum, or cross-source reconciliation on-chain
+//!
+//! Integrators should only use this contract when those trust assumptions are acceptable
+//! for their asset and risk model. See the repository threat model:
+//! [`docs/THREAT_MODEL.md#price-oracle-manipulation-resistance-assumptions`](../../../docs/THREAT_MODEL.md#price-oracle-manipulation-resistance-assumptions).
 
 use shared_utils::Validation;
 use soroban_sdk::{
@@ -31,6 +43,11 @@ pub enum OracleError {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Last published price snapshot for a single asset.
+///
+/// `updated_at` is the ledger timestamp of the accepted oracle write. Consumers that
+/// need freshness guarantees should prefer `get_price_valid` instead of trusting
+/// `get_price` directly.
 pub struct PriceData {
     pub price: i128,
     pub updated_at: u64,
@@ -39,6 +56,7 @@ pub struct PriceData {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Oracle-level configuration used for freshness checks.
 pub struct OracleConfig {
     pub max_staleness_seconds: u64,
 }
@@ -154,11 +172,22 @@ fn require_valid_wasm_hash(e: &Env, wasm_hash: &BytesN<32>) -> Result<(), Oracle
 }
 
 #[contract]
+/// CommitLabs price oracle contract.
+///
+/// This contract enforces write authorization with an admin-managed whitelist and
+/// protects readers against stale or future-dated prices through `get_price_valid`.
+/// It does not attempt to solve market manipulation on-chain beyond those controls.
+///
+/// Threat model reference:
+/// [`docs/THREAT_MODEL.md#price-oracle-manipulation-resistance-assumptions`](../../../docs/THREAT_MODEL.md#price-oracle-manipulation-resistance-assumptions)
 pub struct PriceOracleContract;
 
 #[contractimpl]
 impl PriceOracleContract {
     /// Initialize the oracle with an admin. Call once.
+    ///
+    /// Sets the initial trust root for oracle whitelisting and configures the default
+    /// freshness window to one hour.
     pub fn initialize(e: Env, admin: Address) -> Result<(), OracleError> {
         if e.storage().instance().has(&DataKey::Admin) {
             return Err(OracleError::AlreadyInitialized);
@@ -174,6 +203,9 @@ impl PriceOracleContract {
     }
 
     /// Add an address to the oracle whitelist (can push prices). Admin only.
+    ///
+    /// Security: whitelisted addresses are trusted publishers. A compromised oracle key
+    /// can replace the latest on-chain price for any asset it updates.
     pub fn add_oracle(e: Env, caller: Address, oracle_address: Address) -> Result<(), OracleError> {
         require_admin(&e, &caller);
         e.storage()
@@ -201,6 +233,9 @@ impl PriceOracleContract {
     }
 
     /// Set price for an asset. Caller must be whitelisted. Validates price >= 0.
+    ///
+    /// This stores exactly one latest price per asset; it does not aggregate multiple
+    /// submissions or compare against external references.
     pub fn set_price(
         e: Env,
         caller: Address,
@@ -226,7 +261,10 @@ impl PriceOracleContract {
         Ok(())
     }
 
-    /// Get last price and timestamp for an asset. Returns (0, 0, 0) if not set.
+    /// Get last price and timestamp for an asset. Returns `(0, 0, 0)` if not set.
+    ///
+    /// This function does not enforce freshness. Contracts making security-sensitive
+    /// decisions should prefer `get_price_valid`.
     pub fn get_price(e: Env, asset: Address) -> PriceData {
         e.storage()
             .instance()
@@ -239,7 +277,16 @@ impl PriceOracleContract {
     }
 
     /// Get price if it exists and is not stale; otherwise error.
-    /// `max_staleness_override`: if Some(secs), use instead of contract default.
+    ///
+    /// Returns `StalePrice` when:
+    /// - the current ledger timestamp is later than `updated_at + max_staleness`, or
+    /// - the stored `updated_at` is in the future relative to the current ledger
+    ///
+    /// `max_staleness_override`: if `Some(secs)`, use that instead of the contract default.
+    ///
+    /// This is the primary reader API for manipulation resistance. Integrators should
+    /// choose a staleness window that matches the liquidity and operational assumptions
+    /// of their downstream contract.
     pub fn get_price_valid(
         e: Env,
         asset: Address,
@@ -263,13 +310,16 @@ impl PriceOracleContract {
     }
 
     /// Set default max staleness (seconds). Admin only.
+    ///
+    /// Lower values reduce the window in which stale or delayed updates are accepted,
+    /// but increase the chance of rejecting otherwise usable data during oracle outages.
     pub fn set_max_staleness(e: Env, caller: Address, seconds: u64) -> Result<(), OracleError> {
         require_admin(&e, &caller);
         set_max_staleness_internal(&e, seconds);
         Ok(())
     }
 
-    /// Get max staleness setting.
+    /// Get max staleness setting used by `get_price_valid` when no override is supplied.
     pub fn get_max_staleness(e: Env) -> u64 {
         read_config(&e).max_staleness_seconds
     }
@@ -285,6 +335,8 @@ impl PriceOracleContract {
     }
 
     /// Update admin (admin-only).
+    ///
+    /// Transfers control over whitelist management and configuration.
     pub fn set_admin(e: Env, caller: Address, new_admin: Address) -> Result<(), OracleError> {
         require_admin_result(&e, &caller)?;
         e.storage().instance().set(&DataKey::Admin, &new_admin);
@@ -299,7 +351,7 @@ impl PriceOracleContract {
         Ok(())
     }
 
-    /// Migrate storage from a previous version to CURRENT_VERSION (admin-only).
+    /// Migrate storage from a previous version to `CURRENT_VERSION` (admin-only).
     pub fn migrate(e: Env, caller: Address, from_version: u32) -> Result<(), OracleError> {
         require_admin_result(&e, &caller)?;
 
