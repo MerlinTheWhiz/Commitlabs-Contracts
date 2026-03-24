@@ -201,6 +201,30 @@ Run all tests:
 cargo test --package commitment_nft test_transfer
 ```
 
+## time_lock
+
+| Function | Summary | Access control | Notes |
+| --- | --- | --- | --- |
+| initialize(admin) | Set the initial timelock admin. | None (single-use). | Establishes the authority allowed to queue and cancel actions. |
+| queue_action(action_type, target, data, delay) -> Result<u64> | Queue a delayed governance action. | Stored admin `require_auth`. | Delay must be at least the action-type minimum and no more than 30 days. |
+| execute_action(action_id) -> Result | Execute a matured action. | Permissionless after delay. | Anyone may execute once `executable_at` is reached. |
+| cancel_action(action_id) -> Result | Cancel a queued action. | Stored admin `require_auth`. | Fails if the action already executed or was already cancelled. |
+| get_action(action_id) -> Result<QueuedAction> | Read queued action metadata. | View. | Includes `queued_at`, `executable_at`, and execution state. |
+| get_all_actions() -> Vec<u64> | Read all queued action ids. | View. | Includes executed and cancelled actions. |
+| get_pending_actions() -> Vec<u64> | Read actions that are neither executed nor cancelled. | View. | Useful for operator review and execution scans. |
+| get_executable_actions() -> Vec<u64> | Read pending actions whose delay has elapsed. | View. | Actions are executable at exactly `executable_at`. |
+| get_admin() -> Address | Read the current admin. | View. | Returns the authority for queue/cancel operations. |
+| get_min_delay(action_type) -> u64 | Read the minimum delay for an action type. | View. | Current floors: 1 day for parameter/fee, 2 days for admin, 3 days for upgrade. |
+| get_max_delay() -> u64 | Read the global maximum allowed delay. | View. | Hard cap is 30 days. |
+| get_action_count() -> u64 | Read total number of queued actions. | View. | Monotonic counter for action ids. |
+
+### time_lock operational notes
+
+- Queueing and cancellation are admin-authorized operations; execution is intentionally permissionless after the delay.
+- Operators should record `action_id`, `queued_at`, and `executable_at` immediately after queueing.
+- Use the smallest action type that accurately reflects blast radius, but not the smallest delay by default.
+- Runbook reference: `docs/TIMELOCK_RUNBOOK.md#timelock-parameter-runbook`
+
 ## shared_utils
 
 | Module         | Functions                                                              | Notes                                     |
