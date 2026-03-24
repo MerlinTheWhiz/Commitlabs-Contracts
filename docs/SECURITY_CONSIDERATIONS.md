@@ -41,6 +41,11 @@
 - shared_utils RateLimiter is available and configurable by admin.
 - Rate limits are disabled until explicitly configured; audit should confirm desired defaults.
 
+## Timelock operations
+- `time_lock` requires admin authorization for queue and cancel operations.
+- `time_lock` execution is permissionless after the delay, which improves liveness but means operators must review queued actions before the execution window opens.
+- Delay selection should follow the operational guidance in `docs/TIMELOCK_RUNBOOK.md`.
+
 ## Event emission
 - Key state changes emit events (commitments created, allocations, attestations, mint/transfer/settle).
 - Off-chain indexers should verify expected topics and payload consistency.
