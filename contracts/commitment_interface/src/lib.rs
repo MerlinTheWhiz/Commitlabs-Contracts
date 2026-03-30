@@ -87,7 +87,7 @@ impl CommitmentInterface {
     }
 
     /// List commitment ids owned by the supplied address.
-    pub fn get_owner_commitments(_env: Env, _owner: Address) -> Result<Vec<String>, Error> {
+    pub fn get_owner_commitments(_env: Env, _owner: Address, _offset: u32, _limit: u32) -> Result<Vec<String>, Error> {
         unimplemented!("interface only")
     }
 
@@ -210,7 +210,7 @@ mod tests {
             "pub fn initialize(e: Env, admin: Address, nft_contract: Address)",
             "pub fn create_commitment( e: Env, owner: Address, amount: i128, asset_address: Address, rules: CommitmentRules, ) -> String",
             "pub fn get_commitment(e: Env, commitment_id: String) -> Commitment",
-            "pub fn get_owner_commitments(e: Env, owner: Address) -> Vec<String>",
+            "pub fn get_owner_commitments(e: Env, owner: Address, offset: u32, limit: u32) -> Vec<String>",
             "pub fn get_total_commitments(e: Env) -> u64",
             "pub fn settle(e: Env, commitment_id: String)",
             "pub fn early_exit(e: Env, commitment_id: String, caller: Address)",

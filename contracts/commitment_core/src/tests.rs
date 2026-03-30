@@ -374,7 +374,7 @@ fn test_create_commitment_rolls_back_when_nft_mint_fails() {
     assert!(result.is_err());
     assert_eq!(client.get_total_commitments(), 0);
     assert_eq!(client.get_total_value_locked(), 0);
-    assert_eq!(client.get_owner_commitments(&owner).len(), 0);
+    assert_eq!(client.get_owner_commitments(&owner, &0u32, &50u32).len(), 0);
     assert_eq!(token_client.balance(&owner), amount * 2);
     assert_eq!(token_client.balance(&contract_id), 0);
 }
@@ -873,7 +873,7 @@ fn test_get_owner_commitments() {
 
     // Initially empty
     let commitments = e.as_contract(&contract_id, || {
-        CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone())
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone(), 0, 50)
     });
     assert_eq!(commitments.len(), 0);
 }
@@ -898,7 +898,7 @@ fn test_list_commitments_by_owner_matches_get_owner_commitments() {
     });
 
     let via_get = e.as_contract(&contract_id, || {
-        CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone())
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone(), 0, 50)
     });
     let via_list = e.as_contract(&contract_id, || {
         CommitmentCoreContract::list_commitments_by_owner(e.clone(), owner.clone())
@@ -2630,4 +2630,322 @@ fn test_owner_multiple_commitments_settle_one() {
 
     let c3 = client.get_commitment(&String::from_str(&e, "commit_003"));
     assert_eq!(c3.status, String::from_str(&e, "active"));
+}
+
+// ============================================================================
+// Issue #201 – get_owner_commitments: pagination & stress tests
+// ============================================================================
+
+/// Seed `count` commitment IDs for `owner` directly into storage (no token/NFT setup needed).
+/// IDs are generated using the same numeric-suffix scheme as the contract: "c_0", "c_1", …
+fn seed_owner_commitments(e: &Env, contract_id: &Address, owner: &Address, count: u32) -> Vec<String> {
+    let mut ids = Vec::new(e);
+    for i in 0..count {
+        // Build "c_<i>" without alloc::format! (no_std environment).
+        let mut buf = [0u8; 12]; // "c_" + up to 10 digits
+        buf[0] = b'c';
+        buf[1] = b'_';
+        let mut n = i;
+        let mut digits = [0u8; 10];
+        let mut d = 0usize;
+        if n == 0 {
+            digits[0] = b'0';
+            d = 1;
+        } else {
+            while n > 0 {
+                digits[d] = (n % 10) as u8 + b'0';
+                n /= 10;
+                d += 1;
+            }
+        }
+        for j in 0..d {
+            buf[2 + j] = digits[d - 1 - j];
+        }
+        let label = core::str::from_utf8(&buf[..2 + d]).unwrap_or("c_0");
+        ids.push_back(String::from_str(e, label));
+    }
+    e.as_contract(contract_id, || {
+        e.storage()
+            .instance()
+            .set(&DataKey::OwnerCommitments(owner.clone()), &ids);
+    });
+    ids
+}
+
+fn init_contract(e: &Env) -> Address {
+    let contract_id = e.register_contract(None, CommitmentCoreContract);
+    let admin = Address::generate(e);
+    let nft = Address::generate(e);
+    e.as_contract(&contract_id, || {
+        CommitmentCoreContract::initialize(e.clone(), admin, nft);
+    });
+    contract_id
+}
+
+// --- Empty / unknown owner ---
+
+/// An address that has never created a commitment must return an empty Vec,
+/// not panic or error.
+#[test]
+fn test_get_owner_commitments_unknown_owner_returns_empty() {
+    let e = Env::default();
+    let contract_id = init_contract(&e);
+    let stranger = Address::generate(&e);
+
+    let result = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_owner_commitments(e.clone(), stranger, 0, 50)
+    });
+    assert_eq!(result.len(), 0);
+}
+
+/// Calling with limit=0 must always return empty regardless of stored data.
+#[test]
+fn test_get_owner_commitments_limit_zero_returns_empty() {
+    let e = Env::default();
+    let contract_id = init_contract(&e);
+    let owner = Address::generate(&e);
+    seed_owner_commitments(&e, &contract_id, &owner, 10);
+
+    let result = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner, 0, 0)
+    });
+    assert_eq!(result.len(), 0);
+}
+
+/// offset >= total must return empty rather than panic.
+#[test]
+fn test_get_owner_commitments_offset_beyond_total_returns_empty() {
+    let e = Env::default();
+    let contract_id = init_contract(&e);
+    let owner = Address::generate(&e);
+    seed_owner_commitments(&e, &contract_id, &owner, 5);
+
+    // offset == total
+    let r1 = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone(), 5, 10)
+    });
+    assert_eq!(r1.len(), 0);
+
+    // offset > total
+    let r2 = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone(), 100, 10)
+    });
+    assert_eq!(r2.len(), 0);
+}
+
+// --- Pagination boundaries ---
+
+/// First page: offset=0, limit=3 of 5 items → 3 items, correct IDs.
+#[test]
+fn test_get_owner_commitments_first_page() {
+    let e = Env::default();
+    let contract_id = init_contract(&e);
+    let owner = Address::generate(&e);
+    seed_owner_commitments(&e, &contract_id, &owner, 5);
+
+    let page = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner, 0, 3)
+    });
+    assert_eq!(page.len(), 3);
+    assert_eq!(page.get(0).unwrap(), String::from_str(&e, "c_0"));
+    assert_eq!(page.get(1).unwrap(), String::from_str(&e, "c_1"));
+    assert_eq!(page.get(2).unwrap(), String::from_str(&e, "c_2"));
+}
+
+/// Middle page: offset=2, limit=2 of 5 items → items at index 2 and 3.
+#[test]
+fn test_get_owner_commitments_middle_page() {
+    let e = Env::default();
+    let contract_id = init_contract(&e);
+    let owner = Address::generate(&e);
+    seed_owner_commitments(&e, &contract_id, &owner, 5);
+
+    let page = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner, 2, 2)
+    });
+    assert_eq!(page.len(), 2);
+    assert_eq!(page.get(0).unwrap(), String::from_str(&e, "c_2"));
+    assert_eq!(page.get(1).unwrap(), String::from_str(&e, "c_3"));
+}
+
+/// Last partial page: offset=3, limit=10 of 5 items → only 2 items returned.
+#[test]
+fn test_get_owner_commitments_last_partial_page() {
+    let e = Env::default();
+    let contract_id = init_contract(&e);
+    let owner = Address::generate(&e);
+    seed_owner_commitments(&e, &contract_id, &owner, 5);
+
+    let page = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner, 3, 10)
+    });
+    assert_eq!(page.len(), 2);
+    assert_eq!(page.get(0).unwrap(), String::from_str(&e, "c_3"));
+    assert_eq!(page.get(1).unwrap(), String::from_str(&e, "c_4"));
+}
+
+/// limit > MAX_PAGE_SIZE is silently capped; result must not exceed MAX_PAGE_SIZE.
+#[test]
+fn test_get_owner_commitments_limit_capped_at_max_page_size() {
+    let e = Env::default();
+    let contract_id = init_contract(&e);
+    let owner = Address::generate(&e);
+    // Seed more than MAX_PAGE_SIZE items
+    seed_owner_commitments(&e, &contract_id, &owner, MAX_PAGE_SIZE + 10);
+
+    let page = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner, 0, MAX_PAGE_SIZE + 10)
+    });
+    assert_eq!(page.len(), MAX_PAGE_SIZE);
+}
+
+/// Exact single-item page: offset=4, limit=1 of 5 items.
+#[test]
+fn test_get_owner_commitments_single_item_page() {
+    let e = Env::default();
+    let contract_id = init_contract(&e);
+    let owner = Address::generate(&e);
+    seed_owner_commitments(&e, &contract_id, &owner, 5);
+
+    let page = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner, 4, 1)
+    });
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.get(0).unwrap(), String::from_str(&e, "c_4"));
+}
+
+/// limit exactly equals total count → all items returned in one call.
+#[test]
+fn test_get_owner_commitments_limit_equals_total() {
+    let e = Env::default();
+    let contract_id = init_contract(&e);
+    let owner = Address::generate(&e);
+    seed_owner_commitments(&e, &contract_id, &owner, 10);
+
+    let page = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner, 0, 10)
+    });
+    assert_eq!(page.len(), 10);
+}
+
+// --- Pagination consistency (full iteration) ---
+
+/// Iterating through all pages must reconstruct the full ordered list without
+/// duplicates or gaps.
+#[test]
+fn test_get_owner_commitments_full_iteration_consistency() {
+    let e = Env::default();
+    let contract_id = init_contract(&e);
+    let owner = Address::generate(&e);
+    let total: u32 = 15;
+    let seeded = seed_owner_commitments(&e, &contract_id, &owner, total);
+
+    let page_size: u32 = 4;
+    let mut collected = Vec::new(&e);
+    let mut offset: u32 = 0;
+    loop {
+        let page = e.as_contract(&contract_id, || {
+            CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone(), offset, page_size)
+        });
+        let page_len = page.len();
+        for item in page.iter() {
+            collected.push_back(item);
+        }
+        if page_len < page_size {
+            break;
+        }
+        offset += page_size;
+    }
+
+    assert_eq!(collected.len(), total);
+    for i in 0..total {
+        assert_eq!(collected.get(i).unwrap(), seeded.get(i).unwrap());
+    }
+}
+
+// --- Read-only / no state mutation ---
+
+/// Calling get_owner_commitments must not alter the stored commitment list.
+#[test]
+fn test_get_owner_commitments_does_not_mutate_storage() {
+    let e = Env::default();
+    let contract_id = init_contract(&e);
+    let owner = Address::generate(&e);
+    seed_owner_commitments(&e, &contract_id, &owner, 5);
+
+    // Call twice; both results must be identical.
+    let first = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone(), 0, 50)
+    });
+    let second = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone(), 0, 50)
+    });
+    assert_eq!(first, second);
+}
+
+// --- Stress test ---
+
+/// Seed MAX_PAGE_SIZE (50) commitments and page through them in chunks of 10,
+/// verifying every ID is present exactly once and in order.
+///
+/// This is the primary stress test for Issue #201. It confirms the pagination
+/// logic stays within Soroban's resource budget for the maximum supported page
+/// size and that no IDs are dropped or duplicated across pages.
+#[test]
+fn test_get_owner_commitments_stress_50_commitments_paginated() {
+    let e = Env::default();
+    let contract_id = init_contract(&e);
+    let owner = Address::generate(&e);
+    let total = MAX_PAGE_SIZE; // 50
+    let seeded = seed_owner_commitments(&e, &contract_id, &owner, total);
+
+    let page_size: u32 = 10;
+    let mut all_retrieved = Vec::new(&e);
+    let mut offset: u32 = 0;
+
+    loop {
+        let page = e.as_contract(&contract_id, || {
+            CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone(), offset, page_size)
+        });
+        let page_len = page.len();
+        assert!(page_len <= page_size, "page exceeded requested limit");
+        for id in page.iter() {
+            all_retrieved.push_back(id);
+        }
+        if page_len < page_size {
+            break;
+        }
+        offset += page_size;
+    }
+
+    assert_eq!(all_retrieved.len(), total, "total retrieved must equal total seeded");
+    for i in 0..total {
+        assert_eq!(
+            all_retrieved.get(i).unwrap(),
+            seeded.get(i).unwrap(),
+            "mismatch at index {i}"
+        );
+    }
+}
+
+/// Two different owners must have completely independent commitment lists.
+#[test]
+fn test_get_owner_commitments_isolation_between_owners() {
+    let e = Env::default();
+    let contract_id = init_contract(&e);
+    let owner_a = Address::generate(&e);
+    let owner_b = Address::generate(&e);
+
+    seed_owner_commitments(&e, &contract_id, &owner_a, 3);
+    seed_owner_commitments(&e, &contract_id, &owner_b, 7);
+
+    let a_page = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner_a, 0, 50)
+    });
+    let b_page = e.as_contract(&contract_id, || {
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner_b, 0, 50)
+    });
+
+    assert_eq!(a_page.len(), 3);
+    assert_eq!(b_page.len(), 7);
 }
