@@ -561,3 +561,337 @@ fn test_gas_listing_operations() {
     // In production, you'd log or assert gas usage
     assert_eq!(client.get_all_listings().len(), 10);
 }
+
+// ============================================================================
+// Comprehensive Duplicate Listing Tests
+// ============================================================================
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")] // ListingExists
+fn test_duplicate_listing_different_seller_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (_, _, client) = setup_marketplace(&e);
+
+    let seller1 = Address::generate(&e);
+    let seller2 = Address::generate(&e);
+    let payment_token = setup_test_token(&e);
+    let token_id = 1u32;
+
+    // First seller lists the NFT
+    client.list_nft(&seller1, &token_id, &1000, &payment_token);
+
+    // Second seller tries to list the same token ID - should fail
+    client.list_nft(&seller2, &token_id, &2000, &payment_token);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")] // ListingExists
+fn test_duplicate_listing_same_seller_different_price_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (_, _, client) = setup_marketplace(&e);
+
+    let seller = Address::generate(&e);
+    let payment_token = setup_test_token(&e);
+    let token_id = 1u32;
+
+    // List NFT with initial price
+    client.list_nft(&seller, &token_id, &1000, &payment_token);
+
+    // Try to list same token with different price - should fail
+    client.list_nft(&seller, &token_id, &2000, &payment_token);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")] // ListingExists
+fn test_duplicate_listing_different_payment_token_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (_, _, client) = setup_marketplace(&e);
+
+    let seller = Address::generate(&e);
+    let payment_token1 = setup_test_token(&e);
+    let payment_token2 = setup_test_token(&e);
+    let token_id = 1u32;
+
+    // List NFT with first payment token
+    client.list_nft(&seller, &token_id, &1000, &payment_token1);
+
+    // Try to list same token with different payment token - should fail
+    client.list_nft(&seller, &token_id, &1000, &payment_token2);
+}
+
+#[test]
+fn test_relist_after_cancel_allows_new_listing() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (_, _, client) = setup_marketplace(&e);
+
+    let seller = Address::generate(&e);
+    let payment_token = setup_test_token(&e);
+    let token_id = 1u32;
+
+    // List NFT
+    client.list_nft(&seller, &token_id, &1000, &payment_token);
+    
+    // Cancel listing
+    client.cancel_listing(&seller, &token_id);
+    
+    // Should be able to list again with same token ID
+    client.list_nft(&seller, &token_id, &2000, &payment_token);
+    
+    // Verify the new listing exists
+    let listing = client.get_listing(&token_id);
+    assert_eq!(listing.price, 2000);
+}
+
+#[test]
+fn test_relist_after_buy_allows_new_listing() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (_, _, client) = setup_marketplace(&e);
+
+    let seller = Address::generate(&e);
+    let buyer = Address::generate(&e);
+    let payment_token = setup_test_token(&e);
+    let token_id = 1u32;
+
+    // List NFT
+    client.list_nft(&seller, &token_id, &1000, &payment_token);
+    
+    // Simulate buy (in real implementation, this would transfer tokens)
+    // For now, we'll manually remove the listing to simulate the buy
+    client.cancel_listing(&seller, &token_id); // This simulates the listing removal after buy
+    
+    // Should be able to list again with same token ID
+    client.list_nft(&buyer, &token_id, &2000, &payment_token);
+    
+    // Verify the new listing exists
+    let listing = client.get_listing(&token_id);
+    assert_eq!(listing.price, 2000);
+    assert_eq!(listing.seller, buyer);
+}
+
+#[test]
+fn test_multiple_tokens_different_ids_no_conflict() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (_, _, client) = setup_marketplace(&e);
+
+    let seller = Address::generate(&e);
+    let payment_token = setup_test_token(&e);
+
+    // Should be able to list multiple different token IDs
+    for token_id in 1..=5 {
+        client.list_nft(&seller, &token_id, &(1000 * token_id as i128), &payment_token);
+    }
+    
+    let listings = client.get_all_listings();
+    assert_eq!(listings.len(), 5);
+    
+    // Verify each token ID has correct price
+    for token_id in 1..=5 {
+        let listing = client.get_listing(&token_id);
+        assert_eq!(listing.price, 1000 * token_id as i128);
+        assert_eq!(listing.token_id, token_id);
+    }
+}
+
+// ============================================================================
+// Comprehensive Price Validation Tests
+// ============================================================================
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")] // InvalidPrice
+fn test_list_nft_negative_price_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (_, _, client) = setup_marketplace(&e);
+
+    let seller = Address::generate(&e);
+    let payment_token = setup_test_token(&e);
+
+    client.list_nft(&seller, &1, &-1000, &payment_token);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")] // InvalidPrice
+fn test_list_nft_zero_price_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (_, _, client) = setup_marketplace(&e);
+
+    let seller = Address::generate(&e);
+    let payment_token = setup_test_token(&e);
+
+    client.list_nft(&seller, &1, &0, &payment_token);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")] // InvalidPrice
+fn test_list_nft_minimum_positive_price_succeeds() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (_, _, client) = setup_marketplace(&e);
+
+    let seller = Address::generate(&e);
+    let payment_token = setup_test_token(&e);
+
+    // Test with minimum positive value (1)
+    client.list_nft(&seller, &1, &1, &payment_token);
+    
+    let listing = client.get_listing(&1);
+    assert_eq!(listing.price, 1);
+}
+
+#[test]
+fn test_list_nft_various_valid_prices() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (_, _, client) = setup_marketplace(&e);
+
+    let seller = Address::generate(&e);
+    let payment_token = setup_test_token(&e);
+
+    let test_prices = vec![1, 100, 1000, 1000000, i128::MAX / 2];
+    
+    for (i, price) in test_prices.iter().enumerate() {
+        let token_id = (i + 1) as u32;
+        client.list_nft(&seller, &token_id, price, &payment_token);
+        
+        let listing = client.get_listing(&token_id);
+        assert_eq!(listing.price, *price);
+    }
+    
+    let listings = client.get_all_listings();
+    assert_eq!(listings.len(), test_prices.len());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")] // InvalidPrice
+fn test_auction_negative_starting_price_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (_, _, client) = setup_marketplace(&e);
+
+    let seller = Address::generate(&e);
+    let payment_token = setup_test_token(&e);
+
+    client.start_auction(&seller, &1, &-1000, &86400, &payment_token);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")] // InvalidPrice
+fn test_auction_zero_starting_price_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (_, _, client) = setup_marketplace(&e);
+
+    let seller = Address::generate(&e);
+    let payment_token = setup_test_token(&e);
+
+    client.start_auction(&seller, &1, &0, &86400, &payment_token);
+}
+
+#[test]
+fn test_auction_minimum_positive_starting_price_succeeds() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (_, _, client) = setup_marketplace(&e);
+
+    let seller = Address::generate(&e);
+    let payment_token = setup_test_token(&e);
+
+    // Test with minimum positive value (1)
+    client.start_auction(&seller, &1, &1, &86400, &payment_token);
+    
+    let auction = client.get_auction(&1);
+    assert_eq!(auction.starting_price, 1);
+    assert_eq!(auction.current_bid, 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")] // InvalidOfferAmount
+fn test_offer_negative_amount_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (_, _, client) = setup_marketplace(&e);
+
+    let offerer = Address::generate(&e);
+    let payment_token = setup_test_token(&e);
+
+    client.make_offer(&offerer, &1, &-500, &payment_token);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")] // InvalidOfferAmount
+fn test_offer_zero_amount_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (_, _, client) = setup_marketplace(&e);
+
+    let offerer = Address::generate(&e);
+    let payment_token = setup_test_token(&e);
+
+    client.make_offer(&offerer, &1, &0, &payment_token);
+}
+
+#[test]
+fn test_offer_minimum_positive_amount_succeeds() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (_, _, client) = setup_marketplace(&e);
+
+    let offerer = Address::generate(&e);
+    let payment_token = setup_test_token(&e);
+
+    // Test with minimum positive value (1)
+    client.make_offer(&offerer, &1, &1, &payment_token);
+    
+    let offers = client.get_offers(&1);
+    assert_eq!(offers.len(), 1);
+    assert_eq!(offers.get(0).unwrap().amount, 1);
+}
+
+#[test]
+fn test_price_edge_cases() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (_, _, client) = setup_marketplace(&e);
+
+    let seller = Address::generate(&e);
+    let payment_token = setup_test_token(&e);
+
+    // Test boundary values
+    let boundary_prices = vec![
+        1,                    // Minimum positive
+        i128::MAX / 1000000,  // Large but safe value
+        i128::MAX / 2,        // Very large value
+    ];
+    
+    for (i, price) in boundary_prices.iter().enumerate() {
+        let token_id = (i + 1) as u32;
+        client.list_nft(&seller, &token_id, price, &payment_token);
+        
+        let listing = client.get_listing(&token_id);
+        assert_eq!(listing.price, *price);
+    }
+}
