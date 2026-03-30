@@ -86,8 +86,9 @@ jobs:
       # -----------------------------
       - name: Build Soroban contracts with Stellar CLI
         run: |
-          if ! command -v stellar &> /dev/null && ! command -v soroban &> /dev/null; then
-            echo "Skipping CLI build (CLI not installed)"
+          if ( ! command -v stellar &> /dev/null || ! stellar --version &> /dev/null ) && \
+             ( ! command -v soroban &> /dev/null || ! soroban --version &> /dev/null ); then
+            echo "Skipping CLI build (CLI not installed or broken)"
             exit 0
           fi
 
@@ -98,10 +99,12 @@ jobs:
 
               cd "$contract"
 
-              if command -v soroban &> /dev/null; then
+              if command -v soroban &> /dev/null && soroban --version &> /dev/null; then
                 soroban contract build
-              else
+              elif command -v stellar &> /dev/null && stellar --version &> /dev/null; then
                 stellar contract build
+              else
+                echo "No working CLI found for $contract_name, skipping."
               fi
 
               cd - > /dev/null
