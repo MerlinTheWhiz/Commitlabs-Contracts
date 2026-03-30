@@ -271,8 +271,11 @@ cargo test --package commitment_nft test_transfer
 | access_control | require_admin, require_owner, require_owner_or_admin                   | Uses Storage::get_admin and require_auth. |
 | errors         | log_error, panic_with_log, require                                     | Centralized error logging helpers.        |
 | events         | emit_created, emit_updated, emit_transfer, emit_violation              | Standard event wrappers.                  |
-| math           | add, sub, mul, div, percent, loss_percent, gain_percent                | Safe arithmetic with checked operations.  |
+| math           | add, sub, mul, div, percent, loss_percent, gain_percent                | Safe arithmetic with proptest validation. |
 | rate_limiting  | set_limit, clear_limit, check, set_exempt                              | Fixed-window rate limiter.                |
 | storage        | set_initialized, get_admin, get_or_default                             | Instance storage helpers.                 |
 | time           | now, calculate_expiration, is_expired                                  | Ledger time utilities.                    |
-| validation     | require_positive, require_valid_percent, require_valid_commitment_type | Common validation guards.                 |
+| validation     | require_positive, require_valid_percent, require_valid_commitment_type | Common validation with proptest coverage. |
+
+> [!NOTE]
+> Math and validation utilities are covered by property-based tests (proptest) to ensure arithmetic safety and correct boundary validation. These tests can be enabled via the `fuzzing` workspace feature.
