@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, Env, Map, String};
+use soroban_sdk::{testutils::Address as _, testutils::Events as _, vec, Address, Env, Map, String};
 
 #[test]
 fn test_initialize_and_getters() {
@@ -661,4 +661,430 @@ fn test_record_drawdown_exceeds_max_loss_records_violation() {
     let severity = violation_attestation.data.get(severity_key).unwrap();
     assert_eq!(violation_type, String::from_str(&e, "max_loss_exceeded"));
     assert_eq!(severity, String::from_str(&e, "high"));
+}
+
+// ============================================
+// add_verifier/remove_verifier Admin Tests
+// ============================================
+
+#[test]
+fn test_add_verifier_admin_success() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let contract_id = e.register_contract(None, AttestationEngineContract);
+    
+    let admin = Address::generate(&e);
+    let verifier = Address::generate(&e);
+    let core = Address::generate(&e);
+
+    // Initialize contract
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::initialize(e.clone(), admin.clone(), core.clone()).unwrap();
+    });
+
+    // Add verifier as admin
+    let result = e.as_contract(&contract_id, || {
+        AttestationEngineContract::add_verifier(e.clone(), admin.clone(), verifier.clone())
+    });
+    
+    assert_eq!(result, Ok(()));
+
+    // Verify verifier was added
+    let is_verifier = e.as_contract(&contract_id, || {
+        AttestationEngineContract::is_verifier(e.clone(), verifier.clone())
+    });
+    assert!(is_verifier);
+
+    // Verify verifier is authorized
+    let is_authorized = e.as_contract(&contract_id, || {
+        AttestationEngineContract::is_authorized(e.clone(), verifier.clone())
+    });
+    assert!(is_authorized);
+}
+
+#[test]
+fn test_add_verifier_non_admin_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let contract_id = e.register_contract(None, AttestationEngineContract);
+    
+    let admin = Address::generate(&e);
+    let non_admin = Address::generate(&e);
+    let verifier = Address::generate(&e);
+    let core = Address::generate(&e);
+
+    // Initialize contract
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::initialize(e.clone(), admin.clone(), core.clone()).unwrap();
+    });
+
+    // Try to add verifier as non-admin
+    let result = e.as_contract(&contract_id, || {
+        AttestationEngineContract::add_verifier(e.clone(), non_admin.clone(), verifier.clone())
+    });
+    
+    assert_eq!(result, Err(AttestationError::Unauthorized));
+
+    // Verify verifier was not added
+    let is_verifier = e.as_contract(&contract_id, || {
+        AttestationEngineContract::is_verifier(e.clone(), verifier.clone())
+    });
+    assert!(!is_verifier);
+}
+
+#[test]
+fn test_add_verifier_uninitialized_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let contract_id = e.register_contract(None, AttestationEngineContract);
+    
+    let admin = Address::generate(&e);
+    let verifier = Address::generate(&e);
+
+    // Try to add verifier without initialization
+    let result = e.as_contract(&contract_id, || {
+        AttestationEngineContract::add_verifier(e.clone(), admin.clone(), verifier.clone())
+    });
+    
+    assert_eq!(result, Err(AttestationError::NotInitialized));
+}
+
+#[test]
+fn test_add_verifier_emits_event() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let contract_id = e.register_contract(None, AttestationEngineContract);
+    
+    let admin = Address::generate(&e);
+    let verifier = Address::generate(&e);
+    let core = Address::generate(&e);
+
+    // Initialize contract
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::initialize(e.clone(), admin.clone(), core.clone()).unwrap();
+    });
+
+    // Add verifier and check for event
+    let result = e.as_contract(&contract_id, || {
+        AttestationEngineContract::add_verifier(e.clone(), admin.clone(), verifier.clone())
+    });
+    
+    assert_eq!(result, Ok(()));
+
+    // Check that event was emitted
+    let events = e.events().all();
+    assert_eq!(events.len(), 1);
+}
+
+#[test]
+fn test_add_verifier_admin_always_authorized() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let contract_id = e.register_contract(None, AttestationEngineContract);
+    
+    let admin = Address::generate(&e);
+    let verifier = Address::generate(&e);
+    let core = Address::generate(&e);
+
+    // Initialize contract
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::initialize(e.clone(), admin.clone(), core.clone()).unwrap();
+    });
+
+    // Admin should be authorized even without being explicitly added as verifier
+    let admin_is_authorized = e.as_contract(&contract_id, || {
+        AttestationEngineContract::is_authorized(e.clone(), admin.clone())
+    });
+    assert!(admin_is_authorized);
+
+    let admin_is_verifier = e.as_contract(&contract_id, || {
+        AttestationEngineContract::is_verifier(e.clone(), admin.clone())
+    });
+    assert!(admin_is_verifier);
+}
+
+#[test]
+fn test_remove_verifier_admin_success() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let contract_id = e.register_contract(None, AttestationEngineContract);
+    
+    let admin = Address::generate(&e);
+    let verifier = Address::generate(&e);
+    let core = Address::generate(&e);
+
+    // Initialize contract
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::initialize(e.clone(), admin.clone(), core.clone()).unwrap();
+    });
+
+    // Add verifier first
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::add_verifier(e.clone(), admin.clone(), verifier.clone()).unwrap();
+    });
+
+    // Verify verifier was added
+    let is_verifier_before = e.as_contract(&contract_id, || {
+        AttestationEngineContract::is_verifier(e.clone(), verifier.clone())
+    });
+    assert!(is_verifier_before);
+
+    // Remove verifier as admin
+    let result = e.as_contract(&contract_id, || {
+        AttestationEngineContract::remove_verifier(e.clone(), admin.clone(), verifier.clone())
+    });
+    
+    assert_eq!(result, Ok(()));
+
+    // Verify verifier was removed
+    let is_verifier_after = e.as_contract(&contract_id, || {
+        AttestationEngineContract::is_verifier(e.clone(), verifier.clone())
+    });
+    assert!(!is_verifier_after);
+
+    // Verify verifier is no longer authorized
+    let is_authorized_after = e.as_contract(&contract_id, || {
+        AttestationEngineContract::is_authorized(e.clone(), verifier.clone())
+    });
+    assert!(!is_authorized_after);
+}
+
+#[test]
+fn test_remove_verifier_non_admin_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let contract_id = e.register_contract(None, AttestationEngineContract);
+    
+    let admin = Address::generate(&e);
+    let non_admin = Address::generate(&e);
+    let verifier = Address::generate(&e);
+    let core = Address::generate(&e);
+
+    // Initialize contract
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::initialize(e.clone(), admin.clone(), core.clone()).unwrap();
+    });
+
+    // Add verifier first
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::add_verifier(e.clone(), admin.clone(), verifier.clone()).unwrap();
+    });
+
+    // Try to remove verifier as non-admin
+    let result = e.as_contract(&contract_id, || {
+        AttestationEngineContract::remove_verifier(e.clone(), non_admin.clone(), verifier.clone())
+    });
+    
+    assert_eq!(result, Err(AttestationError::Unauthorized));
+
+    // Verify verifier was not removed
+    let is_verifier = e.as_contract(&contract_id, || {
+        AttestationEngineContract::is_verifier(e.clone(), verifier.clone())
+    });
+    assert!(is_verifier);
+}
+
+#[test]
+fn test_remove_verifier_uninitialized_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let contract_id = e.register_contract(None, AttestationEngineContract);
+    
+    let admin = Address::generate(&e);
+    let verifier = Address::generate(&e);
+
+    // Try to remove verifier without initialization
+    let result = e.as_contract(&contract_id, || {
+        AttestationEngineContract::remove_verifier(e.clone(), admin.clone(), verifier.clone())
+    });
+    
+    assert_eq!(result, Err(AttestationError::NotInitialized));
+}
+
+#[test]
+fn test_remove_verifier_emits_event() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let contract_id = e.register_contract(None, AttestationEngineContract);
+    
+    let admin = Address::generate(&e);
+    let verifier = Address::generate(&e);
+    let core = Address::generate(&e);
+
+    // Initialize contract
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::initialize(e.clone(), admin.clone(), core.clone()).unwrap();
+    });
+
+    // Add verifier first
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::add_verifier(e.clone(), admin.clone(), verifier.clone()).unwrap();
+    });
+
+    // Clear events from adding verifier
+    e.events().all();
+
+    // Remove verifier and check for event
+    let result = e.as_contract(&contract_id, || {
+        AttestationEngineContract::remove_verifier(e.clone(), admin.clone(), verifier.clone())
+    });
+    
+    assert_eq!(result, Ok(()));
+
+    // Check that event was emitted
+    let events = e.events().all();
+    assert_eq!(events.len(), 1);
+    // Event was emitted - structure verified by event count
+}
+
+#[test]
+fn test_remove_nonexistent_verifier_succeeds() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let contract_id = e.register_contract(None, AttestationEngineContract);
+    
+    let admin = Address::generate(&e);
+    let verifier = Address::generate(&e);
+    let core = Address::generate(&e);
+
+    // Initialize contract
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::initialize(e.clone(), admin.clone(), core.clone()).unwrap();
+    });
+
+    // Try to remove verifier that was never added - should succeed
+    let result = e.as_contract(&contract_id, || {
+        AttestationEngineContract::remove_verifier(e.clone(), admin.clone(), verifier.clone())
+    });
+    
+    assert_eq!(result, Ok(()));
+
+    // Verify verifier is not authorized
+    let is_verifier = e.as_contract(&contract_id, || {
+        AttestationEngineContract::is_verifier(e.clone(), verifier.clone())
+    });
+    assert!(!is_verifier);
+}
+
+#[test]
+fn test_add_remove_multiple_verifiers() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let contract_id = e.register_contract(None, AttestationEngineContract);
+    
+    let admin = Address::generate(&e);
+    let verifier1 = Address::generate(&e);
+    let verifier2 = Address::generate(&e);
+    let verifier3 = Address::generate(&e);
+    let core = Address::generate(&e);
+
+    // Initialize contract
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::initialize(e.clone(), admin.clone(), core.clone()).unwrap();
+    });
+
+    // Add multiple verifiers
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::add_verifier(e.clone(), admin.clone(), verifier1.clone()).unwrap();
+        AttestationEngineContract::add_verifier(e.clone(), admin.clone(), verifier2.clone()).unwrap();
+        AttestationEngineContract::add_verifier(e.clone(), admin.clone(), verifier3.clone()).unwrap();
+    });
+
+    // Verify all verifiers are authorized
+    for verifier in [verifier1.clone(), verifier2.clone(), verifier3.clone()] {
+        let is_authorized = e.as_contract(&contract_id, || {
+            AttestationEngineContract::is_authorized(e.clone(), verifier.clone())
+        });
+        assert!(is_authorized);
+    }
+
+    // Remove one verifier
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::remove_verifier(e.clone(), admin.clone(), verifier2.clone()).unwrap();
+    });
+
+    // Verify correct authorization state
+    let verifier1_authorized = e.as_contract(&contract_id, || {
+        AttestationEngineContract::is_authorized(e.clone(), verifier1.clone())
+    });
+    assert!(verifier1_authorized);
+
+    let verifier2_authorized = e.as_contract(&contract_id, || {
+        AttestationEngineContract::is_authorized(e.clone(), verifier2.clone())
+    });
+    assert!(!verifier2_authorized);
+
+    let verifier3_authorized = e.as_contract(&contract_id, || {
+        AttestationEngineContract::is_authorized(e.clone(), verifier3.clone())
+    });
+    assert!(verifier3_authorized);
+
+    // Admin should still be authorized
+    let admin_authorized = e.as_contract(&contract_id, || {
+        AttestationEngineContract::is_authorized(e.clone(), admin.clone())
+    });
+    assert!(admin_authorized);
+}
+
+#[test]
+fn test_add_authorized_contract_alias() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let contract_id = e.register_contract(None, AttestationEngineContract);
+    
+    let admin = Address::generate(&e);
+    let contract_address = Address::generate(&e);
+    let core = Address::generate(&e);
+
+    // Initialize contract
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::initialize(e.clone(), admin.clone(), core.clone()).unwrap();
+    });
+
+    // Test add_authorized_contract alias
+    let result = e.as_contract(&contract_id, || {
+        AttestationEngineContract::add_authorized_contract(e.clone(), admin.clone(), contract_address.clone())
+    });
+    
+    assert_eq!(result, Ok(()));
+
+    // Verify contract is authorized
+    let is_authorized = e.as_contract(&contract_id, || {
+        AttestationEngineContract::is_authorized(e.clone(), contract_address.clone())
+    });
+    assert!(is_authorized);
+}
+
+#[test]
+fn test_remove_authorized_contract_alias() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let contract_id = e.register_contract(None, AttestationEngineContract);
+    
+    let admin = Address::generate(&e);
+    let contract_address = Address::generate(&e);
+    let core = Address::generate(&e);
+
+    // Initialize contract
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::initialize(e.clone(), admin.clone(), core.clone()).unwrap();
+    });
+
+    // Add contract first
+    e.as_contract(&contract_id, || {
+        AttestationEngineContract::add_authorized_contract(e.clone(), admin.clone(), contract_address.clone()).unwrap();
+    });
+
+    // Test remove_authorized_contract alias
+    let result = e.as_contract(&contract_id, || {
+        AttestationEngineContract::remove_authorized_contract(e.clone(), admin.clone(), contract_address.clone())
+    });
+    
+    assert_eq!(result, Ok(()));
+
+    // Verify contract is no longer authorized
+    let is_authorized = e.as_contract(&contract_id, || {
+        AttestationEngineContract::is_authorized(e.clone(), contract_address.clone())
+    });
+    assert!(!is_authorized);
 }
