@@ -302,6 +302,91 @@ fn test_allocation_rate_limit_enforced() {
     client.allocate(&user, &String::from_str(&env, "c2"), &10_000_000, &Strategy::Balanced);
 }
 
+#[test]
+#[should_panic(expected = "Rate limit exceeded")]
+fn test_rebalance_rate_limit_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, core_id, client) = create_contract(&env);
+
+    // Configure rate limit for rebalance: 1 call per 60 seconds
+    let fn_symbol = soroban_sdk::Symbol::new(&env, "rebal");
+    client.set_rate_limit(&admin, &fn_symbol, &60u64, &1u32);
+
+    let user = Address::generate(&env);
+    
+    setup_test_pools(&env, &client, &admin);
+    
+    create_mock_commitment(&env, &core_id, "c1", 10_000_000, "active");
+
+    // First allocate
+    client.allocate(&user, &String::from_str(&env, "c1"), &10_000_000, &Strategy::Balanced);
+
+    // First rebalance should succeed
+    client.rebalance(&user, &String::from_str(&env, "c1"));
+
+    // Second rebalance should panic due to rate limit
+    client.rebalance(&user, &String::from_str(&env, "c1"));
+}
+
+#[test]
+fn test_allocation_rate_limit_exempt() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, core_id, client) = create_contract(&env);
+
+    // Configure rate limit: 1 allocation call per 60 seconds
+    let fn_symbol = soroban_sdk::Symbol::new(&env, "alloc");
+    client.set_rate_limit(&admin, &fn_symbol, &60u64, &1u32);
+
+    let user = Address::generate(&env);
+    
+    // Set user as exempt from rate limits
+    client.set_rate_limit_exempt(&admin, &user, &true);
+    
+    setup_test_pools(&env, &client, &admin);
+    
+    create_mock_commitment(&env, &core_id, "c1", 10_000_000, "active");
+    create_mock_commitment(&env, &core_id, "c2", 10_000_000, "active");
+    create_mock_commitment(&env, &core_id, "c3", 10_000_000, "active");
+
+    // Multiple allocations should succeed for exempt user
+    client.allocate(&user, &String::from_str(&env, "c1"), &10_000_000, &Strategy::Balanced);
+    client.allocate(&user, &String::from_str(&env, "c2"), &10_000_000, &Strategy::Balanced);
+    client.allocate(&user, &String::from_str(&env, "c3"), &10_000_000, &Strategy::Balanced);
+}
+
+#[test]
+fn test_rebalance_rate_limit_exempt() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, core_id, client) = create_contract(&env);
+
+    // Configure rate limit for rebalance: 1 call per 60 seconds
+    let fn_symbol = soroban_sdk::Symbol::new(&env, "rebal");
+    client.set_rate_limit(&admin, &fn_symbol, &60u64, &1u32);
+
+    let user = Address::generate(&env);
+    
+    // Set user as exempt from rate limits
+    client.set_rate_limit_exempt(&admin, &user, &true);
+    
+    setup_test_pools(&env, &client, &admin);
+    
+    create_mock_commitment(&env, &core_id, "c1", 10_000_000, "active");
+
+    // First allocate
+    client.allocate(&user, &String::from_str(&env, "c1"), &10_000_000, &Strategy::Balanced);
+
+    // Multiple rebalances should succeed for exempt user
+    client.rebalance(&user, &String::from_str(&env, "c1"));
+    client.rebalance(&user, &String::from_str(&env, "c1"));
+    client.rebalance(&user, &String::from_str(&env, "c1"));
+}
+
 // ============================================================================
 // DESIGN SPIKE: VALIDATION TESTS
 // ============================================================================
