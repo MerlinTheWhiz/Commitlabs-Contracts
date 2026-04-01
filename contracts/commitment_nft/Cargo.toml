@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 testutils = ["soroban-sdk/testutils"]
 benchmark = []
+legacy-test-suite = []
 default = []
 
 [dependencies]
@@ -20,3 +21,4 @@ ed25519-dalek = "2.2.0"
 
 [dev-dependencies]
 soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+commitment_core = { path = "../commitment_core" }
