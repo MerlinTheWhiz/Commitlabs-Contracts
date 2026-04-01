@@ -102,9 +102,14 @@ fn test_create_commitment_i128_max() {
     e.mock_all_auths();
     let contract_id = e.register_contract(None, CommitmentCoreContract);
     let admin = Address::generate(&e);
-    let nft_contract = Address::generate(&e);
+    let nft_contract = e.register_contract(None, MockNftContract);
     let owner = Address::generate(&e);
-    let asset_address = Address::generate(&e);
+    let token_admin = Address::generate(&e);
+
+    let token_contract = e.register_stellar_asset_contract_v2(token_admin);
+    let asset_address = token_contract.address();
+    let token_admin_client = StellarAssetClient::new(&e, &asset_address);
+    token_admin_client.mint(&owner, &1000);
 
     e.as_contract(&contract_id, || {
         CommitmentCoreContract::initialize(e.clone(), admin.clone(), nft_contract.clone());
@@ -587,18 +592,21 @@ fn test_create_commitment_expiration_overflow() {
 
     let contract_id = e.register_contract(None, CommitmentCoreContract);
     let admin = Address::generate(&e);
-    let nft_contract = Address::generate(&e);
+    let nft_contract = e.register_contract(None, MockNftContract);
     let owner = Address::generate(&e);
-    let asset_address = Address::generate(&e);
+    let token_admin = Address::generate(&e);
+    let token_contract = e.register_stellar_asset_contract_v2(token_admin);
+    let asset_address = token_contract.address();
+    let token_admin_client = StellarAssetClient::new(&e, &asset_address);
+    token_admin_client.mint(&owner, &1000);
 
     e.as_contract(&contract_id, || {
         CommitmentCoreContract::initialize(e.clone(), admin.clone(), nft_contract.clone());
     });
 
-    // Set ledger timestamp so created_at + duration_days * 86400 overflows u64
-    e.ledger().with_mut(|l| {
-        l.timestamp = u64::MAX - 50_000;
-    });
+    // Advance the ledger so created_at + duration_days * 86400 overflows u64.
+    // duration_days = 1 → adds 86400 seconds.  u64::MAX - 86399 is the tipping point.
+    e.ledger().set_timestamp(u64::MAX - 86_399);
 
     let rules = CommitmentRules {
         duration_days: 1,
@@ -1756,6 +1764,7 @@ fn test_allocate_when_settled_fails() {
     e.as_contract(&contract_id, || {
         CommitmentCoreContract::allocate(
             e.clone(),
+            admin.clone(),
             String::from_str(&e, commitment_id),
             target_pool.clone(),
             100,
@@ -1788,6 +1797,7 @@ fn test_allocate_when_violated_fails() {
     e.as_contract(&contract_id, || {
         CommitmentCoreContract::allocate(
             e.clone(),
+            admin.clone(),
             String::from_str(&e, commitment_id),
             target_pool.clone(),
             100,
@@ -1820,6 +1830,7 @@ fn test_allocate_when_early_exit_fails() {
     e.as_contract(&contract_id, || {
         CommitmentCoreContract::allocate(
             e.clone(),
+            admin.clone(),
             String::from_str(&e, commitment_id),
             target_pool.clone(),
             100,
@@ -1857,7 +1868,9 @@ fn test_allocate_when_active_succeeds() {
     commitment.asset_address = asset_address;
     store_commitment(&e, &contract_id, &commitment);
 
+    // admin is authorized (is the admin address stored in the contract)
     client.allocate(
+        &admin,
         &String::from_str(&e, commitment_id),
         &target_pool,
         &allocation_amount,
