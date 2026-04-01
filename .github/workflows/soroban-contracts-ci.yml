@@ -11,6 +11,22 @@ env:
   RUN_TESTNET_IT: ${{ secrets.RUN_TESTNET_IT || 'false' }}
 
 jobs:
+  commitment-interface-drift:
+    name: Commitment Interface Drift Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run commitment interface drift tests
+        run: |
+          cargo test -p commitment_interface
+          echo "✓ Commitment interface drift checks passed"
+
   build-and-test:
     name: Build and Test Soroban Contracts
     runs-on: ubuntu-latest
@@ -33,30 +49,15 @@ jobs:
           rustup target add wasm32-unknown-unknown
           rustup target add wasm32v1-none
 
-      # -----------------------------
-      # Cache (optimized)
-      # -----------------------------
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry
-            ~/.cargo/git
-            **/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      # -----------------------------
-      # Install Stellar CLI (Linux-safe)
-      # -----------------------------
-      - name: Install Stellar CLI
-        continue-on-error: true
+      - name: Install Stellar CLI via Homebrew
+        env:
+          GIT_TERMINAL_PROMPT: 0
         run: |
-          curl -L https://github.com/stellar/stellar-cli/releases/latest/download/stellar-cli-linux-amd64 -o stellar
-          chmod +x stellar
-          sudo mv stellar /usr/local/bin/stellar
+          brew tap stellar/stellar-cli 2>/dev/null || true
+          brew install stellar-cli 2>/dev/null || brew install stellar 2>/dev/null || true
+          brew tap stellar/tap || true
+          brew install stellar-cli || brew install stellar
+        continue-on-error: true
 
       # -----------------------------
       # Verify CLI
@@ -111,30 +112,13 @@ jobs:
             fi
           done
 
-          echo "✓ CLI build completed"
-
-      # -----------------------------
-      # Tests (temporarily disabled for merge)
-      # -----------------------------
-      # - name: Run unit tests
-      #   run: |
-      #     cargo test --workspace
-      #     echo "✓ Unit tests passed"
-
-      # - name: Drift check commitment interface
-      #   run: |
-      #     cargo test -p commitment_interface
-      #     echo "✓ Drift checks passed"
-
-      # - name: Run integration tests
-      #   run: |
-      #     cd tests/integration
-      #     cargo test
-      #     echo "✓ Integration tests passed"
-
-      # -----------------------------
-      # Monitoring validation
-      # -----------------------------
+      - name: Run integration tests
+        run: |
+          # Run integration tests from their own directory (separate from workspace)
+          cd tests/integration
+          cargo test
+          echo "✓ Integration tests passed"
+          
       - name: Validate monitoring config
         run: |
           chmod +x monitoring/scripts/validate_monitoring_config.sh
