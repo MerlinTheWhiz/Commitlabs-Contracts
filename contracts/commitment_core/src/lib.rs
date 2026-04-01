@@ -1,12 +1,30 @@
 #![no_std]
 
+//! Core commitment lifecycle contract.
+//!
+//! This contract owns the primary state machine for commitments and coordinates the
+//! highest-risk cross-contract calls in the protocol:
+//! - outbound writes to `commitment_nft` during create, settle, and early-exit flows
+//! - inbound read-only queries from `attestation_engine` through `get_commitment`
+//!
+//! # Call-graph threat review
+//! The end-to-end review for the `commitment_core <-> commitment_nft <-> attestation_engine`
+//! call graph lives in:
+//! [`docs/CORE_NFT_ATTESTATION_THREAT_REVIEW.md#core-nft-attestation-call-graph`](../../../docs/CORE_NFT_ATTESTATION_THREAT_REVIEW.md#core-nft-attestation-call-graph)
+//!
+//! Formal verification planning placeholder:
+//! [`docs/COMMITMENT_CORE_FORMAL_VERIFICATION_SCOPE.md`](../../../docs/COMMITMENT_CORE_FORMAL_VERIFICATION_SCOPE.md)
+
 use shared_utils::{
-    emit_error_event, EmergencyControl, Pausable, RateLimiter, SafeMath, TimeUtils, Validation,
+    emit_error_event, fees, EmergencyControl, Pausable, RateLimiter, SafeMath, TimeUtils,
+    Validation,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address, Env,
     IntoVal, String, Symbol, Vec,
 };
+
+pub mod fuzzing;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -33,6 +51,14 @@ pub enum CommitmentError {
     ZeroAddress = 19,
     /// Duration would cause expires_at to overflow u64
     ExpirationOverflow = 20,
+    /// Invalid fee basis points (must be 0-10000)
+    InvalidFeeBps = 21,
+    /// Fee recipient not set; cannot withdraw
+    FeeRecipientNotSet = 22,
+    /// Insufficient collected fees to withdraw
+    InsufficientFees = 23,
+    /// Arithmetic operation overflowed or underflowed
+    ArithmeticOverflow = 24,
 }
 
 impl CommitmentError {
@@ -58,6 +84,10 @@ impl CommitmentError {
             CommitmentError::NotAuthorizedUpdater => "Commitment has not auth updater",
             CommitmentError::ZeroAddress => "Zero address is not allowed",
             CommitmentError::ExpirationOverflow => "Duration would cause expiration timestamp overflow",
+            CommitmentError::InvalidFeeBps => "Invalid fee basis points: must be 0-10000",
+            CommitmentError::FeeRecipientNotSet => "Fee recipient not set; cannot withdraw",
+            CommitmentError::InsufficientFees => "Insufficient collected fees to withdraw",
+            CommitmentError::ArithmeticOverflow => "Arithmetic overflow or underflow",
         }
     }
 }
@@ -135,6 +165,12 @@ pub enum DataKey {
     AuthorizedUpdaters,
     /// All commitment IDs for time-range queries (analytics). Appended on create.
     AllCommitmentIds,
+    /// Fee recipient (protocol treasury) for fee withdrawals
+    FeeRecipient,
+    /// Creation fee rate in basis points (0-10000)
+    CreationFeeBps,
+    /// Collected fees per asset (asset -> i128)
+    CollectedFees(Address),
 }
 
 // --- Internal Helpers ---
@@ -197,9 +233,9 @@ fn set_commitment(e: &Env, commitment: &Commitment) {
     e.storage().instance().set(&DataKey::Commitment(commitment.commitment_id.clone()), commitment);
 }
 
-fn has_commitment(e: &Env, commitment_id: &String) -> bool {
-    e.storage().instance().has(&DataKey::Commitment(commitment_id.clone()))
-}
+// fn has_commitment(e: &Env, commitment_id: &String) -> bool {
+//     e.storage().instance().has(&DataKey::Commitment(commitment_id.clone()))
+// }
 
 fn require_no_reentrancy(e: &Env) {
     if e.storage().instance().get::<_, bool>(&DataKey::ReentrancyGuard).unwrap_or(false) {
@@ -245,6 +281,15 @@ fn remove_from_owner_commitments(e: &Env, owner: &Address, commitment_id: &Strin
 }
 
 #[contract]
+/// Main protocol contract for commitment state transitions and asset custody.
+///
+/// Security-sensitive behavior:
+/// - holds user assets during the active commitment lifecycle
+/// - calls `commitment_nft` to mirror commitment state into NFT state
+/// - serves canonical commitment reads to `attestation_engine`
+///
+/// Threat review reference:
+/// [`docs/CORE_NFT_ATTESTATION_THREAT_REVIEW.md#core-nft-attestation-call-graph`](../../../docs/CORE_NFT_ATTESTATION_THREAT_REVIEW.md#core-nft-attestation-call-graph)
 pub struct CommitmentCoreContract;
 
 #[contractimpl]
@@ -291,6 +336,10 @@ impl CommitmentCoreContract {
         String::from_str(e, core::str::from_utf8(&buf[..i]).unwrap_or("c_0"))
     }
 
+    /// Initialize the core contract with its admin and linked NFT contract.
+    ///
+    /// The provided `nft_contract` becomes the downstream dependency used by
+    /// `create_commitment`, `settle`, and `early_exit`.
     pub fn initialize(e: Env, admin: Address, nft_contract: Address) {
         if e.storage().instance().has(&DataKey::Admin) {
             fail(&e, CommitmentError::AlreadyInitialized, "initialize");
@@ -311,6 +360,16 @@ impl CommitmentCoreContract {
         EmergencyControl::set_emergency_mode(&e, false);
     }
 
+    /// Create a new commitment, transfer assets into custody, and mint the paired NFT.
+    ///
+    /// Call sequence:
+    /// 1. validate owner auth, rules, and balances
+    /// 2. persist commitment state and counters
+    /// 3. transfer tokens into this contract
+    /// 4. invoke `commitment_nft::mint`
+    ///
+    /// Because Soroban reverts the entire invocation on panic, a downstream NFT mint
+    /// failure should roll back the earlier state writes and token transfer.
     pub fn create_commitment(
         e: Env,
         owner: Address,
@@ -332,20 +391,78 @@ impl CommitmentCoreContract {
         Self::validate_rules(&e, &rules);
         check_sufficient_balance(&e, &owner, &asset_address, amount);
 
+        let creation_fee_bps: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::CreationFeeBps)
+            .unwrap_or(0);
+        let creation_fee = fuzzing::checked_fee_from_bps(amount, creation_fee_bps)
+            .unwrap_or_else(|| {
+                set_reentrancy_guard(&e, false);
+                fail(&e, CommitmentError::ArithmeticOverflow, "create");
+            });
+        let net_amount = amount.checked_sub(creation_fee).unwrap_or_else(|| {
+            set_reentrancy_guard(&e, false);
+            fail(&e, CommitmentError::ArithmeticOverflow, "create");
+        });
+
         let expires_at = TimeUtils::checked_calculate_expiration(&e, rules.duration_days)
             .unwrap_or_else(|| { set_reentrancy_guard(&e, false); fail(&e, CommitmentError::ExpirationOverflow, "create") });
+
+        // Calculate creation fee and net amount
+        let creation_fee_bps: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::CreationFeeBps)
+            .unwrap_or(0);
+        let creation_fee = if creation_fee_bps > 0 {
+            fees::fee_from_bps(amount, creation_fee_bps)
+        } else {
+            0
+        };
+        let net_amount = amount - creation_fee;
 
         let current_total = e.storage().instance().get::<_, u64>(&DataKey::TotalCommitments).unwrap_or(0);
         let nft_contract = e.storage().instance().get::<_, Address>(&DataKey::NftContract)
             .unwrap_or_else(|| { set_reentrancy_guard(&e, false); fail(&e, CommitmentError::NotInitialized, "create") });
 
+        // Calculate creation fee if configured
+        let creation_fee_bps: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::CreationFeeBps)
+            .unwrap_or(0);
+        let creation_fee = if creation_fee_bps > 0 {
+            fees::fee_from_bps(amount, creation_fee_bps)
+        } else {
+            0
+        };
+        // Net amount locked in commitment (after fee deduction)
+        let net_amount = amount - creation_fee;
+
         let commitment_id = Self::generate_commitment_id(&e, current_total);
+
+        // Calculate creation fee first
+        let creation_fee_bps: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::CreationFeeBps)
+            .unwrap_or(0);
+        let creation_fee = if creation_fee_bps > 0 {
+            fees::fee_from_bps(amount, creation_fee_bps)
+        } else {
+            0
+        };
+
+        // Net amount locked in commitment (after fee deduction)
+        let net_amount = amount - creation_fee;
+
         let commitment = Commitment {
             commitment_id: commitment_id.clone(),
             owner: owner.clone(),
             nft_token_id: 0,
             rules: rules.clone(),
-            amount,
+            amount: amount,
             asset_address: asset_address.clone(),
             created_at: TimeUtils::now(&e),
             expires_at,
@@ -369,7 +486,11 @@ impl CommitmentCoreContract {
             .instance()
             .get::<_, i128>(&DataKey::TotalValueLocked)
             .unwrap_or(0);
-        e.storage().instance().set(&DataKey::TotalValueLocked, &(tvl + amount));
+        let updated_tvl = tvl.checked_add(net_amount).unwrap_or_else(|| {
+            set_reentrancy_guard(&e, false);
+            fail(&e, CommitmentError::ArithmeticOverflow, "create");
+        });
+        e.storage().instance().set(&DataKey::TotalValueLocked, &updated_tvl);
 
         let mut all_ids = e
             .storage()
@@ -384,6 +505,19 @@ impl CommitmentCoreContract {
         let contract_address = e.current_contract_address();
         transfer_assets(&e, &owner, &contract_address, &asset_address, amount);
 
+        // Add creation fee to collected fees
+        if creation_fee > 0 {
+            let fee_key = DataKey::CollectedFees(asset_address.clone());
+            let current_fees: i128 = e.storage().instance().get(&fee_key).unwrap_or(0);
+            let updated_fees = current_fees.checked_add(creation_fee).unwrap_or_else(|| {
+                set_reentrancy_guard(&e, false);
+                fail(&e, CommitmentError::ArithmeticOverflow, "create");
+            });
+            e.storage()
+                .instance()
+                .set(&fee_key, &updated_fees);
+        }
+
         let nft_token_id = call_nft_mint(
             &e,
             &nft_contract,
@@ -392,7 +526,7 @@ impl CommitmentCoreContract {
             rules.duration_days,
             rules.max_loss_percent,
             &rules.commitment_type,
-            amount,
+            net_amount,
             &asset_address,
             rules.early_exit_penalty,
         );
@@ -409,6 +543,11 @@ impl CommitmentCoreContract {
         commitment_id
     }
 
+    /// Return the canonical commitment record by id.
+    ///
+    /// This is the read API consumed by `attestation_engine` for compliance checks,
+    /// health metrics, and commitment-existence validation. It intentionally does not
+    /// perform auth checks so downstream contracts can read commitment state.
     pub fn get_commitment(e: Env, commitment_id: String) -> Commitment {
         read_commitment(&e, &commitment_id)
             .unwrap_or_else(|| fail(&e, CommitmentError::CommitmentNotFound, "get_commitment"))
@@ -571,7 +710,11 @@ impl CommitmentCoreContract {
 
         set_commitment(&e, &commitment);
         let tvl = e.storage().instance().get::<_, i128>(&DataKey::TotalValueLocked).unwrap_or(0);
-        e.storage().instance().set(&DataKey::TotalValueLocked, &(tvl - old_value + new_value));
+        let updated_tvl = tvl
+            .checked_sub(old_value)
+            .and_then(|value| value.checked_add(new_value))
+            .unwrap_or_else(|| fail(&e, CommitmentError::ArithmeticOverflow, "upd"));
+        e.storage().instance().set(&DataKey::TotalValueLocked, &updated_tvl);
     }
 
     pub fn check_violations(e: Env, commitment_id: String) -> bool {
@@ -627,6 +770,11 @@ impl CommitmentCoreContract {
         )
     }
 
+    /// Settle an expired commitment, release assets to the owner, and mark the NFT settled.
+    ///
+    /// Cross-contract dependency: invokes `commitment_nft::settle` after the core state and
+    /// token transfer path have been prepared. This flow is guarded by the reentrancy flag and
+    /// relies on transaction rollback if the downstream NFT call fails.
     pub fn settle(e: Env, commitment_id: String) {
         require_no_reentrancy(&e);
         set_reentrancy_guard(&e, true);
@@ -700,6 +848,10 @@ impl CommitmentCoreContract {
         );
     }
 
+    /// Exit a commitment before maturity, apply the configured penalty, and mark the NFT inactive.
+    ///
+    /// Cross-contract dependency: invokes `commitment_nft::mark_inactive` after updating the
+    /// commitment record and returning the post-penalty amount to the owner.
     pub fn early_exit(e: Env, commitment_id: String, caller: Address) {
         require_no_reentrancy(&e);
         set_reentrancy_guard(&e, true);
@@ -722,6 +874,15 @@ impl CommitmentCoreContract {
         let penalty = SafeMath::penalty_amount(commitment.current_value, commitment.rules.early_exit_penalty);
         let returned = SafeMath::sub(commitment.current_value, penalty);
         let original_val = commitment.current_value;
+
+        // Add penalty to collected fees (protocol revenue)
+        if penalty > 0 {
+            let fee_key = DataKey::CollectedFees(commitment.asset_address.clone());
+            let current_fees: i128 = e.storage().instance().get(&fee_key).unwrap_or(0);
+            e.storage()
+                .instance()
+                .set(&fee_key, &(current_fees + penalty));
+        }
 
         commitment.status = String::from_str(&e, "early_exit");
         commitment.current_value = 0;
@@ -875,6 +1036,149 @@ impl CommitmentCoreContract {
         Validation::require_positive(amount);
         transfer_assets(&e, &e.current_contract_address(), &to, &asset, amount);
     }
+
+    // ========================================================================
+    // Fee Management
+    // ========================================================================
+
+    /// Set the creation fee rate in basis points (0-10000).
+    ///
+    /// # Arguments
+    /// * `caller` - Must be admin
+    /// * `bps` - Fee rate in basis points. 100 bps = 1%. Must be 0-10000.
+    ///
+    /// # Security
+    /// - Admin-only: Uses `require_admin` for authorization
+    /// - Validates bps is within valid range (0-10000)
+    ///
+    /// # Errors
+    /// - `CommitmentError::Unauthorized` if caller is not admin
+    /// - `CommitmentError::InvalidFeeBps` if bps > 10000
+    pub fn set_creation_fee_bps(e: Env, caller: Address, bps: u32) {
+        require_admin(&e, &caller);
+        if bps > fees::BPS_MAX {
+            fail(&e, CommitmentError::InvalidFeeBps, "set_creation_fee_bps");
+        }
+        e.storage().instance().set(&DataKey::CreationFeeBps, &bps);
+        e.events().publish(
+            (Symbol::new(&e, "CreationFeeSet"),),
+            (bps, e.ledger().timestamp()),
+        );
+    }
+
+    /// Set the fee recipient (protocol treasury) for fee withdrawals.
+    ///
+    /// # Arguments
+    /// * `caller` - Must be admin
+    /// * `recipient` - Address to receive withdrawn fees
+    ///
+    /// # Security
+    /// - Admin-only: Uses `require_admin` for authorization
+    /// - Validates recipient is not zero address
+    ///
+    /// # Errors
+    /// - `CommitmentError::Unauthorized` if caller is not admin
+    /// - `CommitmentError::ZeroAddress` if recipient is zero address
+    pub fn set_fee_recipient(e: Env, caller: Address, recipient: Address) {
+        require_admin(&e, &caller);
+        if is_zero_address(&e, &recipient) {
+            fail(&e, CommitmentError::ZeroAddress, "set_fee_recipient");
+        }
+        e.storage().instance().set(&DataKey::FeeRecipient, &recipient);
+        e.events().publish(
+            (Symbol::new(&e, "FeeRecipientSet"),),
+            (recipient.clone(), e.ledger().timestamp()),
+        );
+    }
+
+    /// Withdraw collected fees to the configured fee recipient.
+    ///
+    /// # Arguments
+    /// * `caller` - Must be admin
+    /// * `asset_address` - Token address to withdraw fees from
+    /// * `amount` - Amount of fees to withdraw
+    ///
+    /// # Security
+    /// - Admin-only: Uses `require_admin` for authorization
+    /// - Reentrancy protection: Uses existing reentrancy guard
+    /// - Validates fee recipient is set
+    /// - Validates sufficient collected fees exist
+    /// - Amount must be positive
+    ///
+    /// # Errors
+    /// - `CommitmentError::Unauthorized` if caller is not admin
+    /// - `CommitmentError::FeeRecipientNotSet` if recipient not configured
+    /// - `CommitmentError::InsufficientFees` if amount > collected fees
+    /// - `CommitmentError::InvalidAmount` if amount <= 0
+    pub fn withdraw_fees(e: Env, caller: Address, asset_address: Address, amount: i128) {
+        require_no_reentrancy(&e);
+        set_reentrancy_guard(&e, true);
+        require_admin(&e, &caller);
+        Validation::require_positive(amount);
+
+        // Check fee recipient is set
+        let recipient: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::FeeRecipient)
+            .unwrap_or_else(|| {
+                set_reentrancy_guard(&e, false);
+                fail(&e, CommitmentError::FeeRecipientNotSet, "withdraw_fees")
+            });
+
+        // Check sufficient collected fees
+        let fee_key = DataKey::CollectedFees(asset_address.clone());
+        let collected: i128 = e.storage().instance().get(&fee_key).unwrap_or(0);
+        if collected < amount {
+            set_reentrancy_guard(&e, false);
+            fail(&e, CommitmentError::InsufficientFees, "withdraw_fees");
+        }
+
+        // Update collected fees
+        e.storage().instance().set(&fee_key, &(collected - amount));
+
+        // Transfer fees to recipient
+        transfer_assets(&e, &e.current_contract_address(), &recipient, &asset_address, amount);
+
+        set_reentrancy_guard(&e, false);
+        e.events().publish(
+            (Symbol::new(&e, "FeesWithdrawn"), asset_address, recipient),
+            (amount, e.ledger().timestamp()),
+        );
+    }
+
+    /// Get the current creation fee rate in basis points.
+    ///
+    /// # Returns
+    /// Fee rate in basis points (0-10000). Returns 0 if not set.
+    pub fn get_creation_fee_bps(e: Env) -> u32 {
+        e.storage()
+            .instance()
+            .get(&DataKey::CreationFeeBps)
+            .unwrap_or(0)
+    }
+
+    /// Get the configured fee recipient address.
+    ///
+    /// # Returns
+    /// Fee recipient address, or None if not set.
+    pub fn get_fee_recipient(e: Env) -> Option<Address> {
+        e.storage().instance().get(&DataKey::FeeRecipient)
+    }
+
+    /// Get the collected fees for a specific asset.
+    ///
+    /// # Arguments
+    /// * `asset_address` - Token address to query
+    ///
+    /// # Returns
+    /// Amount of collected fees for the asset. Returns 0 if none collected.
+    pub fn get_collected_fees(e: Env, asset_address: Address) -> i128 {
+        e.storage()
+            .instance()
+            .get(&DataKey::CollectedFees(asset_address))
+            .unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -882,6 +1186,12 @@ mod tests;
 
 #[cfg(test)]
 mod emergency_tests;
+
+#[cfg(test)]
+mod fee_tests;
+
+#[cfg(test)]
+mod fuzz_tests;
 
 #[cfg(all(test, feature = "benchmark"))]
 mod benchmarks;

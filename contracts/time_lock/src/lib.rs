@@ -1,5 +1,15 @@
 #![no_std]
 
+//! Timelock governance contract for delayed operational actions.
+//!
+//! This contract lets the configured admin queue governance actions that can only
+//! execute after an action-specific minimum delay. It is intended to slow down
+//! sensitive changes such as upgrades, admin transfers, and parameter updates.
+//!
+//! # Operational runbook
+//! Parameter guidance and operational steps for delay selection live in:
+//! [`docs/TIMELOCK_RUNBOOK.md#timelock-parameter-runbook`](../../../docs/TIMELOCK_RUNBOOK.md#timelock-parameter-runbook)
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String, Vec,
 };
@@ -7,7 +17,9 @@ use soroban_sdk::{
 /// Maximum delay allowed (30 days in seconds)
 const MAX_DELAY: u64 = 2592000;
 
-/// Different action types with their specific delay requirements
+/// Different governance action classes supported by the timelock.
+///
+/// Each action type has a fixed minimum delay returned by [`ActionType::get_delay`].
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ActionType {
@@ -18,7 +30,7 @@ pub enum ActionType {
 }
 
 impl ActionType {
-    /// Get the minimum delay for each action type
+    /// Get the minimum execution delay for this action type, in seconds.
     pub fn get_delay(&self) -> u64 {
         match self {
             ActionType::AdminChange => 172800,    // 2 days
@@ -29,7 +41,7 @@ impl ActionType {
     }
 }
 
-/// Queued action structure
+/// Stored metadata for a queued timelock action.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueuedAction {
@@ -43,7 +55,7 @@ pub struct QueuedAction {
     pub cancelled: bool,
 }
 
-/// Contract errors
+/// Contract errors returned by the timelock contract.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -58,9 +70,10 @@ pub enum Error {
     ActionAlreadyCancelled = 8,
     CannotCancelExecutedAction = 9,
     InvalidActionType = 10,
+    ArithmeticOverflow = 11,
 }
 
-/// Storage keys
+/// Storage keys used by the timelock contract.
 #[contracttype]
 pub enum StorageKey {
     Admin,
@@ -70,11 +83,23 @@ pub enum StorageKey {
 }
 
 #[contract]
+/// Timelock contract that enforces delayed execution for operational changes.
+///
+/// Security model:
+/// - only the stored admin can queue or cancel actions, enforced with `require_auth`
+/// - anyone may execute a queued action once its delay has elapsed
+/// - delay bounds are constrained by action type minimums and a global maximum
+///
+/// Runbook reference:
+/// [`docs/TIMELOCK_RUNBOOK.md#timelock-parameter-runbook`](../../../docs/TIMELOCK_RUNBOOK.md#timelock-parameter-runbook)
 pub struct TimelockContract;
 
 #[contractimpl]
 impl TimelockContract {
-    /// Initialize the contract with an admin
+    /// Initialize the contract with an admin.
+    ///
+    /// This is a single-use setup step that establishes the sole authority allowed
+    /// to queue and cancel timelocked actions.
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().instance().has(&StorageKey::Admin) {
             panic!("Contract already initialized");
@@ -91,7 +116,7 @@ impl TimelockContract {
             .set(&StorageKey::ActionIds, &empty_vec);
     }
 
-    /// Queue a new action with timelock
+    /// Queue a new action with timelock.
     ///
     /// # Arguments
     /// * `action_type` - Type of action being queued
@@ -101,6 +126,11 @@ impl TimelockContract {
     ///
     /// # Returns
     /// * Action ID
+    ///
+    /// Security:
+    /// - requires admin authorization
+    /// - enforces a minimum delay per action type
+    /// - rejects delays above the global maximum
     pub fn queue_action(
         env: Env,
         action_type: ActionType,
@@ -126,14 +156,16 @@ impl TimelockContract {
             .instance()
             .get(&StorageKey::ActionCounter)
             .unwrap();
-        counter += 1;
+        counter = counter.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
         env.storage()
             .instance()
             .set(&StorageKey::ActionCounter, &counter);
 
         // Create queued action
         let current_time = env.ledger().timestamp();
-        let executable_at = current_time + delay;
+        let executable_at = current_time
+            .checked_add(delay)
+            .ok_or(Error::ArithmeticOverflow)?;
 
         let action = QueuedAction {
             id: counter,
@@ -171,8 +203,10 @@ impl TimelockContract {
         Ok(counter)
     }
 
-    /// Execute a queued action after the delay has passed
-    /// Anyone can execute a queued action once the delay has passed
+    /// Execute a queued action after the delay has passed.
+    ///
+    /// Anyone can execute a queued action once the delay has elapsed. This makes
+    /// execution liveness independent from the admin being online at the deadline.
     ///
     /// # Arguments
     /// * `action_id` - ID of the action to execute
@@ -214,8 +248,9 @@ impl TimelockContract {
         Ok(())
     }
 
-    /// Cancel a queued action
-    /// Only admin can cancel actions, and only before they are executed
+    /// Cancel a queued action.
+    ///
+    /// Only the admin can cancel actions, and only before they are executed.
     ///
     /// # Arguments
     /// * `action_id` - ID of the action to cancel
@@ -254,7 +289,7 @@ impl TimelockContract {
         Ok(())
     }
 
-    /// Get details of a queued action
+    /// Get details of a queued action.
     ///
     /// # Arguments
     /// * `action_id` - ID of the action
@@ -268,7 +303,7 @@ impl TimelockContract {
             .ok_or(Error::ActionNotFound)
     }
 
-    /// Get all queued action IDs
+    /// Get all queued action IDs.
     ///
     /// # Returns
     /// * Vector of action IDs
@@ -279,7 +314,7 @@ impl TimelockContract {
             .unwrap_or(Vec::new(&env))
     }
 
-    /// Get pending actions (not executed and not cancelled)
+    /// Get pending actions (not executed and not cancelled).
     ///
     /// # Returns
     /// * Vector of pending action IDs
@@ -302,7 +337,7 @@ impl TimelockContract {
         pending
     }
 
-    /// Get executable actions (pending and past delay)
+    /// Get executable actions (pending and past delay).
     ///
     /// # Returns
     /// * Vector of executable action IDs
@@ -326,7 +361,7 @@ impl TimelockContract {
         executable
     }
 
-    /// Get the current admin address
+    /// Get the current admin address.
     ///
     /// # Returns
     /// * Admin address
@@ -334,7 +369,7 @@ impl TimelockContract {
         env.storage().instance().get(&StorageKey::Admin).unwrap()
     }
 
-    /// Get the minimum delay for an action type
+    /// Get the minimum delay for an action type.
     ///
     /// # Arguments
     /// * `action_type` - Type of action
@@ -346,7 +381,7 @@ impl TimelockContract {
         action_type.get_delay()
     }
 
-    /// Get the maximum allowed delay
+    /// Get the maximum allowed delay.
     ///
     /// # Returns
     /// * Maximum delay in seconds
@@ -355,7 +390,7 @@ impl TimelockContract {
         MAX_DELAY
     }
 
-    /// Get the action counter (total actions queued)
+    /// Get the action counter (total actions queued).
     ///
     /// # Returns
     /// * Total number of actions queued
