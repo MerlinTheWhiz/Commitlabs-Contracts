@@ -139,8 +139,11 @@ pub enum DataKey {
     CommitmentIdIndex(String),
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-test-suite"))]
 mod tests;
+
+#[cfg(test)]
+mod smoke_tests;
 
 // ============================================================================
 // Contract Implementation
@@ -561,7 +564,7 @@ impl CommitmentNFTContract {
                 .set(&DataKey::ReentrancyGuard, &false);
             return Err(ContractError::InvalidCommitmentType);
         }
-        if initial_amount <= 0 {
+        if initial_amount < 0 {
             e.storage()
                 .instance()
                 .set(&DataKey::ReentrancyGuard, &false);

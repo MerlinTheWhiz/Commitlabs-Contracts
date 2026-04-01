@@ -250,8 +250,10 @@ impl CommitmentInterface {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    extern crate alloc;
+
     use super::INTERFACE_VERSION;
     use alloc::{
         string::{String, ToString},
