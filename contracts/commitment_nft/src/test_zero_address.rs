@@ -1,11 +1,10 @@
 #![cfg(test)]
-extern crate std;
 
 use crate::*;
-use soroban_sdk::{testutils::Address as _, Address, Env, String};
+use soroban_sdk::{Address as SdkAddress, Env, String};
 
-fn generate_zero_address(env: &Env) -> Address {
-    Address::from_string(&String::from_str(
+fn generate_zero_address(env: &Env) -> SdkAddress {
+    SdkAddress::from_string(&String::from_str(
         env,
         "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
     ))
@@ -21,20 +20,20 @@ fn test_nft_mint_to_zero_address_fails() {
     let client = CommitmentNFTContractClient::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
-    client.initialize(&admin);
-
     let zero_address = generate_zero_address(&env);
-    
+    let dummy_token_id = 0u32;
+
+    // mint(caller, owner, commitment_id, duration, loss, type, amount, asset, penalty)
     client.mint(
-        &admin, // caller (must be admin)
-        &zero_address, // owner
-        &String::from_str(&env, "commitment"),
-        &30u32,        // duration_days
-        &10u32,        // max_loss_percent
-        &String::from_str(&env, "safe"), // commitment_type
-        &1000i128,     // initial_amount 
-        &zero_address, // asset_address
-        &5u32          // early_exit_penalty
+        &admin,
+        &zero_address,
+        &String::from_str(&env, "commit_1"),
+        &30u32,
+        &10u32,
+        &String::from_str(&env, "balanced"),
+        &1000i128,
+        &asset_address,
+        &5u32
     );
 }
 
@@ -47,27 +46,24 @@ fn test_nft_transfer_to_zero_address_fails() {
     let contract_id = env.register_contract(None, CommitmentNFTContract);
     let client = CommitmentNFTContractClient::new(&env, &contract_id);
 
-    let sender = Address::generate(&env);
+    let sender = SdkAddress::generate(&env);
     let zero_address = generate_zero_address(&env);
     let token_id = 1u32;
-    let asset = Address::generate(&env);
-
-    client.initialize(&sender);
 
     // Setup: Mint to valid sender first
-    client.mint(
-        &sender, // caller
-        &sender, // owner
-        &String::from_str(&env, "commitment"),
-        &30u32,        // duration_days
-        &10u32,        // max_loss_percent
-        &String::from_str(&env, "safe"), // commitment_type
-        &1000i128,     // initial_amount 
-        &asset,        // asset_address
-        &5u32          // early_exit_penalty
+    let token_id = client.mint(
+        &admin,
+        &sender,
+        &String::from_str(&env, "commit_1"),
+        &30u32,
+        &10u32,
+        &String::from_str(&env, "balanced"),
+        &1000i128,
+        &asset_address,
+        &5u32
     );
 
-    // Attempt transfer: (from, to, token_id)
+    let zero_address = generate_zero_address(&env);
     client.transfer(&sender, &zero_address, &token_id);
 }
 
