@@ -1,8 +1,30 @@
+//! Tests for `CommitmentTransformationContract`.
+//!
+//! Coverage goal: every [`TransformationError`] variant must be exercised at
+//! least once.  The matrix below tracks which test triggers which variant:
+//!
+//! | Variant | Discriminant | Test(s) |
+//! |---------|-------------|---------|
+//! | `InvalidAmount` | 1 | `test_error_invalid_amount_withdraw_zero`, `test_error_invalid_amount_withdraw_negative` |
+//! | `InvalidTrancheRatios` | 2 | `test_create_tranches_invalid_ratios`, `test_error_invalid_tranche_ratios_empty`, `test_error_invalid_tranche_ratios_length_mismatch` |
+//! | `InvalidFeeBps` | 3 | `test_error_invalid_fee_bps` |
+//! | `Unauthorized` | 4 | `test_create_tranches_unauthorized`, `test_error_unauthorized_set_fee` |
+//! | `NotInitialized` | 5 | `test_error_not_initialized_get_admin` |
+//! | `AlreadyInitialized` | 6 | `test_initialize_twice_fails` |
+//! | `CommitmentNotFound` | 7 | `test_all_error_messages` (message-level) |
+//! | `TransformationNotFound` | 8 | `test_error_transformation_not_found_tranche_set`, `…collateral`, `…instrument`, `…guarantee` |
+//! | `InvalidState` | 9 | `test_all_error_messages` (message-level) |
+//! | `ReentrancyDetected` | 10 | `test_all_error_messages` (message-level) |
+//! | `FeeRecipientNotSet` | 11 | `test_fee_withdraw_requires_recipient` |
+//! | `InsufficientFees` | 12 | `test_error_insufficient_fees` |
+
 #![cfg(test)]
 
 use super::*;
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{vec, Address, Env, String, Vec};
+use soroban_sdk::{Env, String};
+use crate::mock_commitment_core::{MockCommitmentCore, MockCommitmentCoreClient};
 
 fn setup(e: &Env) -> (Address, Address, Address) {
     let admin = Address::generate(e);
@@ -774,4 +796,46 @@ fn test_withdraw_fees_insufficient() {
     // No fees collected — any positive amount must fail
     let asset = Address::generate(&e);
     client.withdraw_fees(&admin, &asset, &1i128);
+}
+fn setup_env() -> (Env, MockCommitmentCoreClient) {
+
+    let env = Env::default();
+
+    let core_id = env.register_contract(None, MockCommitmentCore);
+    let core_client = MockCommitmentCoreClient::new(&env, &core_id);
+
+    (env, core_client)
+}
+#[test]
+fn test_valid_commitment_id() {
+
+    let (env, core_client) = setup_env();
+
+    let commitment_id = String::from_str(&env, "c_valid");
+
+    let commitment = core_client.get_commitment(&commitment_id);
+
+    assert_eq!(commitment.commitment_id, commitment_id);
+    assert_eq!(commitment.amount, 1000);
+}
+#[test]
+#[should_panic]
+fn test_invalid_commitment_id() {
+
+    let (env, core_client) = setup_env();
+
+    let commitment_id = String::from_str(&env, "unknown");
+
+    core_client.get_commitment(&commitment_id);
+}
+#[test]
+fn test_expired_commitment() {
+
+    let (env, core_client) = setup_env();
+
+    let commitment_id = String::from_str(&env, "c_expired");
+
+    let commitment = core_client.get_commitment(&commitment_id);
+
+    assert_eq!(commitment.status, String::from_str(&env, "expired"));
 }

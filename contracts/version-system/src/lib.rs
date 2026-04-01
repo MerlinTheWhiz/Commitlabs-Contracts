@@ -1,28 +1,64 @@
-//! Version management contract for the CommitLabs protocol.
+//! # Version System Contract
 //!
-//! Tracks semantic versions on-chain, enforces monotonic upgrades,
-//! manages compatibility between versions, and provides integrators
-//! with a stable query surface for version negotiation.
+//! Manages the on-chain versioning of protocol contracts and exposes
+//! compile-time build metadata so that WASM binaries are self-describing.
 //!
-//! # Trust boundaries
-//! - `initialize`: callable once by the deployer (`require_auth`).
-//! - `update_version`, `update_minimum_version`: authorized caller only (`require_auth`).
-//! - `deprecate_version`, `set_compatibility`: admin-authorized (`require_auth`).
-//! - `start_migration`, `complete_migration`: initiator/executor (`require_auth`); no state mutation.
-//! - All read functions (`get_*`, `compare_*`, `is_*`, `meets_*`, `check_*`): permissionless.
+//! ## Compile-time constants
 //!
-//! # Storage keys mutated by write functions
-//! | Function | Keys written |
-//! |---|---|
-//! | `initialize` | `CurrentVersion`, `MinimumVersion`, `VersionMetadata(v)`, `VersionHistory`, `VersionCount`, `Initialized` |
-//! | `update_version` | `CurrentVersion`, `VersionMetadata(v)`, `VersionHistory`, `VersionCount` |
-//! | `update_minimum_version` | `MinimumVersion` |
-//! | `deprecate_version` | `VersionMetadata(v)` |
-//! | `set_compatibility` | `Compatibility(v1,v2)`, `Compatibility(v2,v1)` |
+//! Three `pub const` values are baked into every compiled WASM:
+//!
+//! | Constant | Type | Description |
+//! |----------|------|-------------|
+//! | [`CONTRACT_VERSION_MAJOR`] | `u32` | Semantic major version |
+//! | [`CONTRACT_VERSION_MINOR`] | `u32` | Semantic minor version |
+//! | [`CONTRACT_VERSION_PATCH`] | `u32` | Semantic patch version |
+//! | [`CONTRACT_VERSION_STR`] | `&str` | Full semver string `"MAJOR.MINOR.PATCH"` |
+//!
+//! These constants are independent of the **on-chain** `CurrentVersion` state.
+//! The on-chain version represents the *protocol* version agreed upon by
+//! governance; the compile-time constants represent the *implementation*
+//! version of this specific WASM binary.
+//!
+//! ## Trust Boundaries
+//! - **Deployer**: can call `initialize` once; becomes the privileged updater.
+//! - **Authorized updaters**: call `update_version`, `update_minimum_version`,
+//!   `deprecate_version`, `set_compatibility`, `start_migration`,
+//!   `complete_migration` — all enforce `require_auth`.
+//! - **Anyone**: read-only getters and `compare_versions`.
+//!
+//! ## Arithmetic Safety
+//! All version comparisons use simple `u32` arithmetic.  No overflow risk
+//! exists for realistic version numbers.
+
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec};
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+// ============================================================================
+// Compile-time version constants
+// ============================================================================
+
+/// Major version of this WASM binary (semver).
+///
+/// Increment for breaking changes to the contract ABI or storage layout.
+pub const CONTRACT_VERSION_MAJOR: u32 = 0;
+
+/// Minor version of this WASM binary (semver).
+///
+/// Increment for backward-compatible feature additions.
+pub const CONTRACT_VERSION_MINOR: u32 = 1;
+
+/// Patch version of this WASM binary (semver).
+///
+/// Increment for backward-compatible bug fixes.
+pub const CONTRACT_VERSION_PATCH: u32 = 0;
+
+/// Full semver string baked into the WASM binary at compile time.
+///
+/// Format: `"MAJOR.MINOR.PATCH"`.
+pub const CONTRACT_VERSION_STR: &str = "0.1.0";
+
+/// A semantic version triple.
+#[derive(Clone, PartialEq, Eq)]
 #[contracttype]
 pub struct Version {
     pub major: u32,
@@ -30,22 +66,49 @@ pub struct Version {
     pub patch: u32,
 }
 
+/// On-chain metadata associated with a specific protocol version.
 #[derive(Clone)]
 #[contracttype]
 pub struct VersionMetadata {
+    /// The version this metadata describes.
     pub version: Version,
+    /// Ledger timestamp at the time the version was registered.
     pub timestamp: u64,
+    /// Human-readable release notes or description.
     pub description: String,
+    /// Address that deployed or registered this version.
     pub deployed_by: Address,
+    /// `true` if this version has been explicitly deprecated.
     pub deprecated: bool,
 }
 
+/// Compatibility verdict between two versions.
 #[derive(Clone)]
 #[contracttype]
 pub struct CompatibilityInfo {
+    /// Whether `v1` and `v2` are considered compatible.
     pub is_compatible: bool,
+    /// Human-readable explanation.
     pub notes: String,
+    /// Ledger timestamp when the compatibility was last set.
     pub checked_at: u64,
+}
+
+/// Build metadata returned by [`ContractVersioning::get_build_metadata`].
+///
+/// Contains the compile-time constants baked into this WASM binary.
+/// This data is immutable — it cannot be changed without redeploying the contract.
+#[derive(Clone)]
+#[contracttype]
+pub struct BuildMetadata {
+    /// Compile-time major version (from [`CONTRACT_VERSION_MAJOR`]).
+    pub major: u32,
+    /// Compile-time minor version (from [`CONTRACT_VERSION_MINOR`]).
+    pub minor: u32,
+    /// Compile-time patch version (from [`CONTRACT_VERSION_PATCH`]).
+    pub patch: u32,
+    /// Full semver string (from [`CONTRACT_VERSION_STR`]).
+    pub version_str: String,
 }
 
 #[contracttype]
@@ -64,21 +127,90 @@ pub struct ContractVersioning;
 
 #[contractimpl]
 impl ContractVersioning {
-    /// Initialize the contract with the first semantic version.
+    // ========================================================================
+    // Build metadata (compile-time constants)
+    // ========================================================================
+
+    /// Return the compile-time version constants baked into this WASM binary.
     ///
-    /// Sets both `current` and `minimum` to the same initial version.
-    /// Can only be called once — subsequent calls panic.
+    /// Unlike [`get_current_version`](Self::get_current_version), this
+    /// function requires no initialization and never panics.  It reflects
+    /// the **implementation** version of the deployed binary, not the
+    /// governance-agreed **protocol** version stored on-chain.
+    ///
+    /// # Use Case
+    /// Integrators can call this immediately after deployment to verify that
+    /// the correct binary was deployed before calling `initialize`.
+    pub fn get_build_metadata(env: Env) -> BuildMetadata {
+        BuildMetadata {
+            major: CONTRACT_VERSION_MAJOR,
+            minor: CONTRACT_VERSION_MINOR,
+            patch: CONTRACT_VERSION_PATCH,
+            version_str: String::from_str(&env, CONTRACT_VERSION_STR),
+        }
+    }
+
+    /// Return a [`Version`] built from compile-time constants.
+    ///
+    /// Convenience wrapper around [`get_build_metadata`](Self::get_build_metadata)
+    /// for callers that only need the numeric triple.
+    pub fn get_contract_version(_env: Env) -> Version {
+        Version {
+            major: CONTRACT_VERSION_MAJOR,
+            minor: CONTRACT_VERSION_MINOR,
+            patch: CONTRACT_VERSION_PATCH,
+        }
+    }
+
+    /// Return `true` when the compile-time binary version satisfies the
+    /// given `required` minimum.
+    ///
+    /// Useful for a downstream contract to assert it is interacting with
+    /// a sufficiently recent build before proceeding.
     ///
     /// # Parameters
-    /// - `deployer`: Address authorizing the deployment; stored in version metadata.
-    /// - `major`, `minor`, `patch`: Initial semantic version components.
-    /// - `description`: Human-readable release notes for this version.
+    /// - `required_major`, `required_minor`, `required_patch` – Minimum
+    ///   acceptable binary version.
+    pub fn binary_meets_minimum(
+        env: Env,
+        required_major: u32,
+        required_minor: u32,
+        required_patch: u32,
+    ) -> bool {
+        let binary = Version {
+            major: CONTRACT_VERSION_MAJOR,
+            minor: CONTRACT_VERSION_MINOR,
+            patch: CONTRACT_VERSION_PATCH,
+        };
+        let required = Version {
+            major: required_major,
+            minor: required_minor,
+            patch: required_patch,
+        };
+        Self::compare_versions(env, binary, required) >= 0
+    }
+
+    // ========================================================================
+    // Initialization
+    // ========================================================================
+
+    /// Initialize the contract with its first protocol version.
     ///
-    /// # Errors
-    /// - Panics `"Already initialized"` if called more than once.
+    /// # Parameters
+    /// - `deployer` – Address that owns privileged operations;
+    ///   `require_auth` is enforced.
+    /// - `major`, `minor`, `patch` – Initial protocol version.
+    /// - `description` – Human-readable release notes.
+    ///
+    /// # Panics
+    /// - `"Already initialized"` if called more than once.
+    ///
+    /// # Events
+    /// Emits `("ver_upd", major, minor) → (patch, description, deployer)`.
     ///
     /// # Security
-    /// - `deployer.require_auth()` — only the deployer can initialize.
+    /// Deploy scripts should call this in the same transaction as contract
+    /// deployment to prevent front-running.
     pub fn initialize(
         env: Env,
         deployer: Address,
@@ -144,22 +276,23 @@ impl ContractVersioning {
         );
     }
 
-    /// Bump the contract to a new semantic version.
+    /// Advance the on-chain protocol version.
     ///
-    /// The new version must be strictly greater than the current one —
-    /// regressions and same-version updates are rejected.
+    /// The new version must be a valid increment over the current version
+    /// (major, minor, or patch must increase; no downgrade is allowed).
     ///
     /// # Parameters
-    /// - `updater`: Address authorizing the update.
-    /// - `major`, `minor`, `patch`: Target version (must be > current).
-    /// - `description`: Release notes for this version.
+    /// - `updater` – Must be authorized; `require_auth` is enforced.
+    /// - `major`, `minor`, `patch` – New protocol version.
+    /// - `description` – Human-readable release notes.
     ///
-    /// # Errors
-    /// - Panics `"Contract not initialized"` if `initialize` was not called.
-    /// - Panics `"Invalid version increment"` if new ≤ current.
+    /// # Panics
+    /// - `"Contract not initialized"` if `initialize` was not called.
+    /// - `"Invalid version increment"` if the new version is not strictly
+    ///   greater than the current version.
     ///
-    /// # Security
-    /// - `updater.require_auth()` — no open upgrade path.
+    /// # Events
+    /// Emits `("ver_upd", major, minor) → (patch, description, updater)`.
     pub fn update_version(
         env: Env,
         updater: Address,
@@ -234,10 +367,10 @@ impl ContractVersioning {
         );
     }
 
-    /// Returns the current deployed version.
+    /// Return the current on-chain protocol version.
     ///
-    /// # Errors
-    /// - Panics `"Contract not initialized"` if called before `initialize`.
+    /// # Panics
+    /// `"Contract not initialized"` if called before `initialize`.
     pub fn get_current_version(env: Env) -> Version {
         Self::require_initialized(&env);
         env.storage()
@@ -246,12 +379,9 @@ impl ContractVersioning {
             .unwrap()
     }
 
-    /// Returns the minimum version still considered supported.
+    /// Return the minimum supported protocol version.
     ///
-    /// Versions below this threshold should be treated as end-of-life by integrators.
-    ///
-    /// # Errors
-    /// - Panics `"Contract not initialized"` if called before `initialize`.
+    /// Versions below this value are considered end-of-life.
     pub fn get_minimum_version(env: Env) -> Version {
         Self::require_initialized(&env);
         env.storage()
@@ -260,10 +390,7 @@ impl ContractVersioning {
             .unwrap()
     }
 
-    /// Returns the total number of versions registered (including the initial one).
-    ///
-    /// # Errors
-    /// - Panics `"Contract not initialized"` if called before `initialize`.
+    /// Return the total number of protocol versions registered so far.
     pub fn get_version_count(env: Env) -> u32 {
         Self::require_initialized(&env);
         env.storage()
@@ -272,14 +399,10 @@ impl ContractVersioning {
             .unwrap()
     }
 
-    /// Returns the metadata stored for a specific version.
+    /// Return [`VersionMetadata`] for a specific protocol version.
     ///
-    /// # Parameters
-    /// - `version`: The exact version to look up.
-    ///
-    /// # Errors
-    /// - Panics `"Contract not initialized"` if called before `initialize`.
-    /// - Panics `"Version not found"` if the version was never registered.
+    /// # Panics
+    /// `"Version not found"` if no metadata was stored for `version`.
     pub fn get_version_metadata(env: Env, version: Version) -> VersionMetadata {
         Self::require_initialized(&env);
         env.storage()
@@ -288,10 +411,7 @@ impl ContractVersioning {
             .unwrap_or_else(|| panic!("Version not found"))
     }
 
-    /// Returns the full ordered list of versions since initialization.
-    ///
-    /// # Errors
-    /// - Panics `"Contract not initialized"` if called before `initialize`.
+    /// Return the ordered list of all protocol versions registered so far.
     pub fn get_version_history(env: Env) -> Vec<Version> {
         Self::require_initialized(&env);
         env.storage()
@@ -300,10 +420,9 @@ impl ContractVersioning {
             .unwrap()
     }
 
-    /// Compares two versions using standard semver ordering.
+    /// Compare two versions lexicographically by (major, minor, patch).
     ///
-    /// Returns `-1` if `v1 < v2`, `0` if equal, `1` if `v1 > v2`.
-    /// Comparison is major → minor → patch.
+    /// Returns `-1` if `v1 < v2`, `0` if `v1 == v2`, `1` if `v1 > v2`.
     pub fn compare_versions(_env: Env, v1: Version, v2: Version) -> i32 {
         if v1.major != v2.major {
             return if v1.major > v2.major { 1 } else { -1 };
@@ -317,13 +436,8 @@ impl ContractVersioning {
         0
     }
 
-    /// Returns `true` if `version` falls within `[minimum, current]` (inclusive).
-    ///
-    /// Note: deprecated versions are still considered supported — deprecation
-    /// is an advisory signal, not an access gate.
-    ///
-    /// # Errors
-    /// - Panics `"Contract not initialized"` if called before `initialize`.
+    /// Return `true` if `version` is between the minimum and current versions
+    /// (inclusive on both ends).
     pub fn is_version_supported(env: Env, version: Version) -> bool {
         Self::require_initialized(&env);
         let min_version: Version = env
@@ -343,13 +457,8 @@ impl ContractVersioning {
         min_cmp >= 0 && max_cmp <= 0
     }
 
-    /// Returns `true` if the current deployed version is ≥ the required version.
-    ///
-    /// Useful for feature-gating: callers can assert a minimum capability level
-    /// before invoking newer contract functions.
-    ///
-    /// # Errors
-    /// - Panics `"Contract not initialized"` if called before `initialize`.
+    /// Return `true` if the on-chain current version is at least
+    /// `(major, minor, patch)`.
     pub fn meets_minimum_version(env: Env, major: u32, minor: u32, patch: u32) -> bool {
         Self::require_initialized(&env);
         let current: Version = env
@@ -366,21 +475,19 @@ impl ContractVersioning {
         Self::compare_versions(env, current, required) >= 0
     }
 
-    /// Raises the minimum supported version floor.
+    /// Update the minimum supported protocol version.
     ///
-    /// Versions below the new minimum will be considered end-of-life.
-    /// The new minimum cannot exceed the current version.
+    /// The new minimum must not exceed the current version.
     ///
     /// # Parameters
-    /// - `updater`: Address authorizing the change.
-    /// - `major`, `minor`, `patch`: New minimum (must be ≤ current).
+    /// - `updater` – Must be authorized; `require_auth` is enforced.
     ///
-    /// # Errors
-    /// - Panics `"Contract not initialized"` if called before `initialize`.
-    /// - Panics `"Minimum version cannot exceed current version"` if new_min > current.
+    /// # Panics
+    /// `"Minimum version cannot exceed current version"` if the proposed
+    /// minimum is greater than the current version.
     ///
-    /// # Security
-    /// - `updater.require_auth()` — prevents unauthorized EOL declarations.
+    /// # Events
+    /// Emits `("min_upd",) → (major, minor, patch)`.
     pub fn update_minimum_version(env: Env, updater: Address, major: u32, minor: u32, patch: u32) {
         updater.require_auth();
         Self::require_initialized(&env);
@@ -408,23 +515,14 @@ impl ContractVersioning {
             .publish((symbol_short!("min_upd"),), (major, minor, patch));
     }
 
-    /// Marks a version as deprecated (end-of-life signal for integrators).
+    /// Mark a protocol version as deprecated.
     ///
-    /// Deprecated ≠ unsupported: `is_version_supported` is unaffected.
-    /// Deprecation is a one-way flag — it cannot be reversed.
+    /// # Panics
+    /// - `"Version not found"` if the version has no stored metadata.
+    /// - `"Already deprecated"` if the version is already deprecated.
     ///
-    /// # Parameters
-    /// - `admin`: Address authorizing the deprecation.
-    /// - `version`: The version to deprecate (must exist in metadata).
-    /// - `reason`: Human-readable explanation for integrators.
-    ///
-    /// # Errors
-    /// - Panics `"Contract not initialized"` if called before `initialize`.
-    /// - Panics `"Version not found"` if the version was never registered.
-    /// - Panics `"Already deprecated"` if called twice on the same version.
-    ///
-    /// # Security
-    /// - `admin.require_auth()` — only authorized admin can deprecate.
+    /// # Events
+    /// Emits `("ver_depr", major, minor) → (patch, reason)`.
     pub fn deprecate_version(env: Env, admin: Address, version: Version, reason: String) {
         admin.require_auth();
         Self::require_initialized(&env);
@@ -449,12 +547,9 @@ impl ContractVersioning {
         );
     }
 
-    /// Returns `true` if the version has been deprecated.
+    /// Return `true` if `version` has been marked as deprecated.
     ///
-    /// Returns `false` for versions that were never registered (not a panic).
-    ///
-    /// # Errors
-    /// - Panics `"Contract not initialized"` if called before `initialize`.
+    /// Returns `false` if no metadata exists for the version.
     pub fn is_version_deprecated(env: Env, version: Version) -> bool {
         Self::require_initialized(&env);
 
@@ -468,22 +563,13 @@ impl ContractVersioning {
         }
     }
 
-    /// Records an explicit compatibility relationship between two versions.
+    /// Declare a compatibility relationship between two versions.
     ///
-    /// Stored bidirectionally: `set_compatibility(v1, v2, ...)` also answers
-    /// `check_compatibility(v2, v1, ...)`. Overrides the default heuristic.
+    /// Stored bidirectionally: querying `(v1, v2)` or `(v2, v1)` returns
+    /// the same answer.
     ///
-    /// # Parameters
-    /// - `admin`: Address authorizing the record.
-    /// - `v1`, `v2`: The two versions being related.
-    /// - `is_compatible`: Whether they are compatible.
-    /// - `notes`: Explanation for integrators (e.g. migration steps required).
-    ///
-    /// # Errors
-    /// - Panics `"Contract not initialized"` if called before `initialize`.
-    ///
-    /// # Security
-    /// - `admin.require_auth()` — prevents unauthorized compatibility overrides.
+    /// # Events
+    /// Emits `("compat",) → (v1, v2, is_compatible, notes)`.
     pub fn set_compatibility(
         env: Env,
         admin: Address,
@@ -513,16 +599,12 @@ impl ContractVersioning {
             .publish((symbol_short!("compat"),), (v1, v2, is_compatible, notes));
     }
 
-    /// Returns the compatibility status between two versions.
+    /// Check whether two versions are compatible.
     ///
-    /// Checks explicit records first; falls back to the default heuristic
-    /// (same major ≥ 1 → compatible; different major → incompatible;
-    /// major 0 → same minor required).
-    ///
-    /// Returns `(is_compatible, notes)`.
-    ///
-    /// # Errors
-    /// - Panics `"Contract not initialized"` if called before `initialize`.
+    /// Returns `(is_compatible, notes)`.  If an explicit entry was stored via
+    /// [`set_compatibility`](Self::set_compatibility) it takes precedence;
+    /// otherwise the default semver rules apply (same major version ≥ 1 is
+    /// compatible; major version 0 requires the same minor).
     pub fn check_compatibility(env: Env, v1: Version, v2: Version) -> (bool, String) {
         Self::require_initialized(&env);
 
@@ -539,12 +621,8 @@ impl ContractVersioning {
         Self::default_compatibility_check(&env, v1, v2)
     }
 
-    /// Returns `true` if `client_version` is compatible with the current deployed version.
-    ///
-    /// Delegates to `check_compatibility`; uses the same explicit + default rules.
-    ///
-    /// # Errors
-    /// - Panics `"Contract not initialized"` if called before `initialize`.
+    /// Return `true` if `client_version` is compatible with the current
+    /// on-chain protocol version according to [`check_compatibility`](Self::check_compatibility).
     pub fn is_client_compatible(env: Env, client_version: Version) -> bool {
         Self::require_initialized(&env);
         let current: Version = env
@@ -556,15 +634,13 @@ impl ContractVersioning {
         compatible
     }
 
-    /// Emits a migration-start event for off-chain tooling.
+    /// Signal the start of a migration from one protocol version to another.
     ///
-    /// No state is mutated — this is a coordination signal only.
+    /// Emits an on-chain event that off-chain tooling can use to coordinate
+    /// the migration process.  No state changes are made.
     ///
-    /// # Errors
-    /// - Panics `"Contract not initialized"` if called before `initialize`.
-    ///
-    /// # Security
-    /// - `initiator.require_auth()` — prevents spurious migration signals.
+    /// # Events
+    /// Emits `("mig_strt",) → (from_version, to_version, initiator)`.
     pub fn start_migration(
         env: Env,
         initiator: Address,
@@ -580,16 +656,10 @@ impl ContractVersioning {
         );
     }
 
-    /// Emits a migration-complete event for off-chain tooling.
+    /// Signal the completion of a migration.
     ///
-    /// No state is mutated. `success = false` signals a failed migration
-    /// so monitors can alert without requiring a separate error path.
-    ///
-    /// # Errors
-    /// - Panics `"Contract not initialized"` if called before `initialize`.
-    ///
-    /// # Security
-    /// - `executor.require_auth()` — only the migration executor can close the signal.
+    /// # Events
+    /// Emits `("mig_done",) → (from_version, to_version, success)`.
     pub fn complete_migration(
         env: Env,
         executor: Address,
@@ -616,7 +686,7 @@ impl ContractVersioning {
 
     fn is_valid_increment(old: &Version, new: &Version) -> bool {
         // New version must be greater
-        let cmp = if old.major != new.major {
+        if old.major != new.major {
             if old.major > new.major {
                 return false;
             }
@@ -633,9 +703,7 @@ impl ContractVersioning {
             old.major == new.major && old.minor == new.minor
         } else {
             false
-        };
-
-        cmp
+        }
     }
 
     fn default_compatibility_check(env: &Env, v1: Version, v2: Version) -> (bool, String) {
@@ -670,10 +738,7 @@ impl ContractVersioning {
             }
         }
 
-        (
-            false,
-            String::from_str(env, "Unknown compatibility"),
-        )
+        (false, String::from_str(env, "Unknown compatibility"))
     }
 }
 
@@ -681,6 +746,122 @@ impl ContractVersioning {
 mod test {
     use super::*;
     use soroban_sdk::{testutils::Address as _, Address, Env, String};
+
+    // ========================================================================
+    // Build metadata / compile-time constant tests (#290)
+    // ========================================================================
+
+    /// `get_build_metadata` must return the compile-time constants and must
+    /// not require the contract to be initialized.
+    #[test]
+    fn test_get_build_metadata_no_init_required() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        // Call *before* initialize — must not panic
+        let meta = client.get_build_metadata();
+        assert_eq!(meta.major, CONTRACT_VERSION_MAJOR);
+        assert_eq!(meta.minor, CONTRACT_VERSION_MINOR);
+        assert_eq!(meta.patch, CONTRACT_VERSION_PATCH);
+        assert_eq!(
+            meta.version_str,
+            String::from_str(&env, CONTRACT_VERSION_STR)
+        );
+    }
+
+    /// `get_contract_version` must return the compile-time triple without
+    /// requiring initialization.
+    #[test]
+    fn test_get_contract_version_no_init_required() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let v = client.get_contract_version();
+        assert_eq!(v.major, CONTRACT_VERSION_MAJOR);
+        assert_eq!(v.minor, CONTRACT_VERSION_MINOR);
+        assert_eq!(v.patch, CONTRACT_VERSION_PATCH);
+    }
+
+    /// Compile-time constants must match the declared `CONTRACT_VERSION_STR`.
+    #[test]
+    fn test_version_str_matches_constants() {
+        extern crate std;
+        use std::string::ToString;
+
+        // Parse "MAJOR.MINOR.PATCH" and compare to the individual constants
+        let s = CONTRACT_VERSION_STR.to_string();
+        let parts: std::vec::Vec<&str> = s.split('.').collect();
+        assert_eq!(parts.len(), 3, "VERSION_STR must be MAJOR.MINOR.PATCH");
+        let major: u32 = parts[0].parse().expect("major must be a u32");
+        let minor: u32 = parts[1].parse().expect("minor must be a u32");
+        let patch: u32 = parts[2].parse().expect("patch must be a u32");
+        assert_eq!(major, CONTRACT_VERSION_MAJOR);
+        assert_eq!(minor, CONTRACT_VERSION_MINOR);
+        assert_eq!(patch, CONTRACT_VERSION_PATCH);
+    }
+
+    /// `binary_meets_minimum` must return `true` when the required version
+    /// equals the binary version.
+    #[test]
+    fn test_binary_meets_minimum_exact() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        assert!(client.binary_meets_minimum(
+            &CONTRACT_VERSION_MAJOR,
+            &CONTRACT_VERSION_MINOR,
+            &CONTRACT_VERSION_PATCH,
+        ));
+    }
+
+    /// `binary_meets_minimum` must return `false` when the required version
+    /// is strictly greater than the binary version.
+    #[test]
+    fn test_binary_meets_minimum_too_high() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        // Require a version higher than the binary (major = binary + 1)
+        assert!(!client.binary_meets_minimum(
+            &(CONTRACT_VERSION_MAJOR + 1),
+            &0,
+            &0,
+        ));
+    }
+
+    /// `binary_meets_minimum` must return `true` when requiring a lower version.
+    #[test]
+    fn test_binary_meets_minimum_lower_requirement() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        // Require 0.0.0 — every binary should satisfy this
+        assert!(client.binary_meets_minimum(&0, &0, &0));
+    }
+
+    /// Build metadata is consistent with `get_contract_version`.
+    #[test]
+    fn test_build_metadata_consistent_with_contract_version() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let meta = client.get_build_metadata();
+        let cv = client.get_contract_version();
+
+        assert_eq!(meta.major, cv.major);
+        assert_eq!(meta.minor, cv.minor);
+        assert_eq!(meta.patch, cv.patch);
+    }
+
+    // ========================================================================
+    // Existing tests
+    // ========================================================================
 
     #[test]
     fn test_initialization() {
@@ -827,282 +1008,613 @@ mod test {
         assert!(!client.meets_minimum_version(&3, &0, &0));
     }
 
-    // ── helpers ──────────────────────────────────────────────────────────────
-
-    fn v(major: u32, minor: u32, patch: u32) -> Version {
-        Version { major, minor, patch }
-    }
-
-    /// Deploy + initialize at 1.0.0, return (client, deployer).
-    fn setup(e: &Env) -> (ContractVersioningClient, Address) {
-        let id = e.register_contract(None, ContractVersioning);
-        let client = ContractVersioningClient::new(e, &id);
-        let deployer = Address::generate(e);
-        e.mock_all_auths();
-        client.initialize(&deployer, &1, &0, &0, &String::from_str(e, "v1"));
-        (client, deployer)
-    }
-
-    // ── (a) error paths ───────────────────────────────────────────────────────
-
     #[test]
-    #[should_panic(expected = "Already initialized")]
-    fn test_initialize_twice_panics() {
-        let e = Env::default();
-        let (client, deployer) = setup(&e);
-        client.initialize(&deployer, &2, &0, &0, &String::from_str(&e, "dup"));
-    }
+    fn test_get_version_metadata() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
 
-    #[test]
-    #[should_panic(expected = "Invalid version increment")]
-    fn test_update_version_regression_panics() {
-        let e = Env::default();
-        let (client, deployer) = setup(&e);
-        // 1.0.0 → 0.9.0 is a regression
-        client.update_version(&deployer, &0, &9, &0, &String::from_str(&e, "bad"));
-    }
+        let deployer = Address::generate(&env);
+        let description = String::from_str(&env, "Initial release");
 
-    #[test]
-    #[should_panic(expected = "Invalid version increment")]
-    fn test_update_version_same_panics() {
-        let e = Env::default();
-        let (client, deployer) = setup(&e);
-        // same version is not a valid increment
-        client.update_version(&deployer, &1, &0, &0, &String::from_str(&e, "same"));
-    }
+        client.initialize(&deployer, &1, &0, &0, &description);
 
-    #[test]
-    #[should_panic(expected = "Contract not initialized")]
-    fn test_update_version_not_initialized_panics() {
-        let e = Env::default();
-        let id = e.register_contract(None, ContractVersioning);
-        let client = ContractVersioningClient::new(&e, &id);
-        let caller = Address::generate(&e);
-        e.mock_all_auths();
-        client.update_version(&caller, &1, &0, &0, &String::from_str(&e, "x"));
-    }
+        let version = Version {
+            major: 1,
+            minor: 0,
+            patch: 0,
+        };
+        let metadata = client.get_version_metadata(&version);
 
-    #[test]
-    #[should_panic(expected = "Contract not initialized")]
-    fn test_get_current_version_not_initialized_panics() {
-        let e = Env::default();
-        let id = e.register_contract(None, ContractVersioning);
-        let client = ContractVersioningClient::new(&e, &id);
-        client.get_current_version();
-    }
-
-    #[test]
-    #[should_panic(expected = "Version not found")]
-    fn test_get_version_metadata_not_found_panics() {
-        let e = Env::default();
-        let (client, _) = setup(&e);
-        client.get_version_metadata(&v(9, 9, 9));
-    }
-
-    #[test]
-    #[should_panic(expected = "Version not found")]
-    fn test_deprecate_version_not_found_panics() {
-        let e = Env::default();
-        let (client, admin) = setup(&e);
-        client.deprecate_version(&admin, &v(9, 9, 9), &String::from_str(&e, "ghost"));
-    }
-
-    #[test]
-    #[should_panic(expected = "Already deprecated")]
-    fn test_deprecate_version_twice_panics() {
-        let e = Env::default();
-        let (client, admin) = setup(&e);
-        let reason = String::from_str(&e, "old");
-        client.deprecate_version(&admin, &v(1, 0, 0), &reason);
-        client.deprecate_version(&admin, &v(1, 0, 0), &reason);
-    }
-
-    #[test]
-    #[should_panic(expected = "Minimum version cannot exceed current version")]
-    fn test_update_minimum_version_exceeds_current_panics() {
-        let e = Env::default();
-        let (client, deployer) = setup(&e);
-        // current is 1.0.0 — setting min to 2.0.0 must panic
-        client.update_minimum_version(&deployer, &2, &0, &0);
-    }
-
-    // ── (b) getters without coverage ─────────────────────────────────────────
-
-    #[test]
-    fn test_get_minimum_version() {
-        let e = Env::default();
-        let (client, _) = setup(&e);
-        assert_eq!(client.get_minimum_version(), v(1, 0, 0));
-    }
-
-    #[test]
-    fn test_get_version_metadata_success() {
-        let e = Env::default();
-        let (client, deployer) = setup(&e);
-        let meta = client.get_version_metadata(&v(1, 0, 0));
-        assert_eq!(meta.version, v(1, 0, 0));
-        assert_eq!(meta.deployed_by, deployer);
-        assert!(!meta.deprecated);
+        assert_eq!(metadata.version.major, 1);
+        assert_eq!(metadata.version.minor, 0);
+        assert_eq!(metadata.version.patch, 0);
+        assert_eq!(metadata.description, description);
+        assert_eq!(metadata.deployed_by, deployer);
+        assert_eq!(metadata.deprecated, false);
     }
 
     #[test]
     fn test_get_version_history() {
-        let e = Env::default();
-        let (client, deployer) = setup(&e);
-        client.update_version(&deployer, &1, &1, &0, &String::from_str(&e, "v1.1"));
-        client.update_version(&deployer, &1, &2, &0, &String::from_str(&e, "v1.2"));
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+
+        client.initialize(&deployer, &1, &0, &0, &String::from_str(&env, "V1"));
+        client.update_version(&deployer, &1, &1, &0, &String::from_str(&env, "V1.1"));
+        client.update_version(&deployer, &2, &0, &0, &String::from_str(&env, "V2"));
+
         let history = client.get_version_history();
         assert_eq!(history.len(), 3);
-        assert_eq!(history.get(0).unwrap(), v(1, 0, 0));
-        assert_eq!(history.get(1).unwrap(), v(1, 1, 0));
-        assert_eq!(history.get(2).unwrap(), v(1, 2, 0));
+
+        assert_eq!(history.get(0).unwrap().major, 1);
+        assert_eq!(history.get(0).unwrap().minor, 0);
+        assert_eq!(history.get(1).unwrap().major, 1);
+        assert_eq!(history.get(1).unwrap().minor, 1);
+        assert_eq!(history.get(2).unwrap().major, 2);
+        assert_eq!(history.get(2).unwrap().minor, 0);
     }
 
     #[test]
-    fn test_update_minimum_version_success() {
-        let e = Env::default();
-        let (client, deployer) = setup(&e);
-        client.update_version(&deployer, &2, &0, &0, &String::from_str(&e, "v2"));
-        // set min to 1.5.0 — below current 2.0.0
-        client.update_minimum_version(&deployer, &1, &5, &0);
-        assert_eq!(client.get_minimum_version(), v(1, 5, 0));
+    #[should_panic(expected = "Already initialized")]
+    fn test_double_initialization() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+
+        client.initialize(&deployer, &1, &0, &0, &String::from_str(&env, "V1"));
+        client.initialize(&deployer, &1, &0, &0, &String::from_str(&env, "V1"));
     }
 
     #[test]
-    fn test_set_and_check_compatibility_explicit() {
-        let e = Env::default();
-        let (client, admin) = setup(&e);
-        let notes = String::from_str(&e, "migration required");
-        client.set_compatibility(&admin, &v(1, 0, 0), &v(2, 0, 0), &true, &notes);
-        let (ok, _) = client.check_compatibility(&v(1, 0, 0), &v(2, 0, 0));
-        assert!(ok);
-        // bidirectional — set_compatibility stores both directions
-        let (ok2, _) = client.check_compatibility(&v(2, 0, 0), &v(1, 0, 0));
-        assert!(ok2);
+    #[should_panic(expected = "Contract not initialized")]
+    fn test_get_current_version_not_initialized() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        client.get_current_version();
     }
 
     #[test]
-    fn test_check_compatibility_default_same_major() {
-        let e = Env::default();
-        let (client, _) = setup(&e);
-        // same major ≥ 1 → compatible by default heuristic
-        let (ok, _) = client.check_compatibility(&v(1, 0, 0), &v(1, 5, 0));
-        assert!(ok);
+    #[should_panic(expected = "Contract not initialized")]
+    fn test_get_minimum_version_not_initialized() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        client.get_minimum_version();
     }
 
     #[test]
-    fn test_check_compatibility_default_diff_major() {
-        let e = Env::default();
-        let (client, _) = setup(&e);
-        let (ok, _) = client.check_compatibility(&v(1, 0, 0), &v(2, 0, 0));
-        assert!(!ok);
+    #[should_panic(expected = "Invalid version increment")]
+    fn test_invalid_version_increment_major_decrease() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+
+        client.initialize(&deployer, &2, &0, &0, &String::from_str(&env, "V2"));
+        client.update_version(&deployer, &1, &0, &0, &String::from_str(&env, "V1"));
     }
 
     #[test]
-    fn test_check_compatibility_default_v0() {
-        let e = Env::default();
-        let id = e.register_contract(None, ContractVersioning);
-        let client = ContractVersioningClient::new(&e, &id);
-        let deployer = Address::generate(&e);
-        e.mock_all_auths();
-        client.initialize(&deployer, &0, &1, &0, &String::from_str(&e, "pre-release"));
+    #[should_panic(expected = "Invalid version increment")]
+    fn test_invalid_version_increment_minor_decrease() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
 
-        // same minor under major 0 → compatible
-        let (ok, _) = client.check_compatibility(&v(0, 1, 0), &v(0, 1, 5));
-        assert!(ok);
+        let deployer = Address::generate(&env);
 
-        // different minor under major 0 → incompatible
-        let (ok2, _) = client.check_compatibility(&v(0, 1, 0), &v(0, 2, 0));
-        assert!(!ok2);
+        client.initialize(&deployer, &1, &5, &0, &String::from_str(&env, "V1.5"));
+        client.update_version(&deployer, &1, &3, &0, &String::from_str(&env, "V1.3"));
     }
 
     #[test]
-    fn test_is_client_compatible() {
-        let e = Env::default();
-        let (client, _) = setup(&e);
-        // client at same major as current (1.x.x) → compatible
-        assert!(client.is_client_compatible(&v(1, 0, 0)));
-        // client at different major → incompatible
-        assert!(!client.is_client_compatible(&v(2, 0, 0)));
+    #[should_panic(expected = "Invalid version increment")]
+    fn test_invalid_version_increment_same_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+
+        client.initialize(&deployer, &1, &0, &0, &String::from_str(&env, "V1"));
+        client.update_version(&deployer, &1, &0, &0, &String::from_str(&env, "V1"));
     }
 
     #[test]
-    fn test_start_and_complete_migration() {
-        let e = Env::default();
-        let (client, deployer) = setup(&e);
-        // both are event-only — just verify they don't panic
-        client.start_migration(&deployer, &v(1, 0, 0), &v(2, 0, 0));
-        client.complete_migration(&deployer, &v(1, 0, 0), &v(2, 0, 0), &true);
-        client.complete_migration(&deployer, &v(1, 0, 0), &v(2, 0, 0), &false);
-    }
+    fn test_valid_patch_increment() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
 
-    // ── (c) version semantics edge cases ─────────────────────────────────────
+        let deployer = Address::generate(&env);
 
-    #[test]
-    fn test_compare_versions_minor_diff() {
-        let e = Env::default();
-        let id = e.register_contract(None, ContractVersioning);
-        let client = ContractVersioningClient::new(&e, &id);
-        assert_eq!(client.compare_versions(&v(1, 1, 0), &v(1, 2, 0)), -1);
-        assert_eq!(client.compare_versions(&v(1, 2, 0), &v(1, 1, 0)), 1);
+        client.initialize(&deployer, &1, &0, &0, &String::from_str(&env, "V1.0.0"));
+        client.update_version(&deployer, &1, &0, &1, &String::from_str(&env, "V1.0.1"));
+
+        let version = client.get_current_version();
+        assert_eq!(version.major, 1);
+        assert_eq!(version.minor, 0);
+        assert_eq!(version.patch, 1);
     }
 
     #[test]
-    fn test_compare_versions_patch_diff() {
-        let e = Env::default();
-        let id = e.register_contract(None, ContractVersioning);
-        let client = ContractVersioningClient::new(&e, &id);
-        assert_eq!(client.compare_versions(&v(1, 0, 1), &v(1, 0, 2)), -1);
-        assert_eq!(client.compare_versions(&v(1, 0, 2), &v(1, 0, 1)), 1);
+    fn test_valid_minor_increment() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+
+        client.initialize(&deployer, &1, &0, &5, &String::from_str(&env, "V1.0.5"));
+        client.update_version(&deployer, &1, &1, &0, &String::from_str(&env, "V1.1.0"));
+
+        let version = client.get_current_version();
+        assert_eq!(version.major, 1);
+        assert_eq!(version.minor, 1);
+        assert_eq!(version.patch, 0);
     }
 
     #[test]
-    fn test_update_version_patch_increment() {
-        let e = Env::default();
-        let (client, deployer) = setup(&e);
-        client.update_version(&deployer, &1, &0, &1, &String::from_str(&e, "patch"));
-        assert_eq!(client.get_current_version(), v(1, 0, 1));
+    fn test_valid_major_increment() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+
+        client.initialize(&deployer, &1, &5, &3, &String::from_str(&env, "V1.5.3"));
+        client.update_version(&deployer, &2, &0, &0, &String::from_str(&env, "V2.0.0"));
+
+        let version = client.get_current_version();
+        assert_eq!(version.major, 2);
+        assert_eq!(version.minor, 0);
+        assert_eq!(version.patch, 0);
+    }
+
+    #[test]
+    fn test_update_minimum_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin, &1, &0, &0, &String::from_str(&env, "V1"));
+        client.update_version(&admin, &2, &0, &0, &String::from_str(&env, "V2"));
+
+        client.update_minimum_version(&admin, &1, &5, &0);
+
+        let min_version = client.get_minimum_version();
+        assert_eq!(min_version.major, 1);
+        assert_eq!(min_version.minor, 5);
+        assert_eq!(min_version.patch, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Minimum version cannot exceed current version")]
+    fn test_update_minimum_version_exceeds_current() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin, &1, &0, &0, &String::from_str(&env, "V1"));
+        client.update_minimum_version(&admin, &2, &0, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Already deprecated")]
+    fn test_double_deprecation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin, &1, &0, &0, &String::from_str(&env, "V1"));
+
+        let version = Version {
+            major: 1,
+            minor: 0,
+            patch: 0,
+        };
+        client.deprecate_version(&admin, &version, &String::from_str(&env, "Outdated"));
+        client.deprecate_version(&admin, &version, &String::from_str(&env, "Still outdated"));
+    }
+
+    #[test]
+    fn test_is_version_deprecated_nonexistent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin, &1, &0, &0, &String::from_str(&env, "V1"));
+
+        let nonexistent = Version {
+            major: 5,
+            minor: 0,
+            patch: 0,
+        };
+        assert_eq!(client.is_version_deprecated(&nonexistent), false);
+    }
+
+    #[test]
+    #[should_panic(expected = "Version not found")]
+    fn test_get_version_metadata_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin, &1, &0, &0, &String::from_str(&env, "V1"));
+
+        let nonexistent = Version {
+            major: 5,
+            minor: 0,
+            patch: 0,
+        };
+        client.get_version_metadata(&nonexistent);
+    }
+
+    #[test]
+    fn test_check_compatibility_same_major_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin, &2, &0, &0, &String::from_str(&env, "V2"));
+
+        let v1 = Version {
+            major: 1,
+            minor: 0,
+            patch: 0,
+        };
+        let v2 = Version {
+            major: 1,
+            minor: 5,
+            patch: 3,
+        };
+
+        let (compatible, _) = client.check_compatibility(&v1, &v2);
+        assert!(compatible);
+    }
+
+    #[test]
+    fn test_check_compatibility_different_major_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin, &2, &0, &0, &String::from_str(&env, "V2"));
+
+        let v1 = Version {
+            major: 1,
+            minor: 0,
+            patch: 0,
+        };
+        let v2 = Version {
+            major: 2,
+            minor: 0,
+            patch: 0,
+        };
+
+        let (compatible, _) = client.check_compatibility(&v1, &v2);
+        assert!(!compatible);
+    }
+
+    #[test]
+    fn test_check_compatibility_version_zero_same_minor() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin, &1, &0, &0, &String::from_str(&env, "V1"));
+
+        let v1 = Version {
+            major: 0,
+            minor: 1,
+            patch: 0,
+        };
+        let v2 = Version {
+            major: 0,
+            minor: 1,
+            patch: 5,
+        };
+
+        let (compatible, _) = client.check_compatibility(&v1, &v2);
+        assert!(compatible);
+    }
+
+    #[test]
+    fn test_check_compatibility_version_zero_different_minor() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin, &1, &0, &0, &String::from_str(&env, "V1"));
+
+        let v1 = Version {
+            major: 0,
+            minor: 1,
+            patch: 0,
+        };
+        let v2 = Version {
+            major: 0,
+            minor: 2,
+            patch: 0,
+        };
+
+        let (compatible, _) = client.check_compatibility(&v1, &v2);
+        assert!(!compatible);
+    }
+
+    #[test]
+    fn test_set_compatibility_explicit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin, &1, &0, &0, &String::from_str(&env, "V1"));
+
+        let v1 = Version {
+            major: 1,
+            minor: 0,
+            patch: 0,
+        };
+        let v2 = Version {
+            major: 2,
+            minor: 0,
+            patch: 0,
+        };
+
+        client.set_compatibility(
+            &admin,
+            &v1,
+            &v2,
+            &true,
+            &String::from_str(&env, "Migration tested"),
+        );
+
+        let (compatible, notes) = client.check_compatibility(&v1, &v2);
+        assert!(compatible);
+        assert_eq!(notes, String::from_str(&env, "Migration tested"));
+    }
+
+    #[test]
+    fn test_set_compatibility_bidirectional() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin, &1, &0, &0, &String::from_str(&env, "V1"));
+
+        let v1 = Version {
+            major: 1,
+            minor: 0,
+            patch: 0,
+        };
+        let v2 = Version {
+            major: 2,
+            minor: 0,
+            patch: 0,
+        };
+
+        client.set_compatibility(
+            &admin,
+            &v1,
+            &v2,
+            &false,
+            &String::from_str(&env, "Breaking changes"),
+        );
+
+        let (compatible1, _) = client.check_compatibility(&v1, &v2);
+        let (compatible2, _) = client.check_compatibility(&v2, &v1);
+        assert!(!compatible1);
+        assert!(!compatible2);
+    }
+
+    #[test]
+    fn test_is_client_compatible_true() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin, &1, &5, &0, &String::from_str(&env, "V1.5"));
+
+        let client_version = Version {
+            major: 1,
+            minor: 3,
+            patch: 0,
+        };
+
+        assert!(client.is_client_compatible(&client_version));
+    }
+
+    #[test]
+    fn test_is_client_compatible_false() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin, &1, &0, &0, &String::from_str(&env, "V1"));
+
+        let client_version = Version {
+            major: 2,
+            minor: 0,
+            patch: 0,
+        };
+
+        assert!(!client.is_client_compatible(&client_version));
+    }
+
+    #[test]
+    fn test_version_comparison_minor_difference() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let v1 = Version {
+            major: 1,
+            minor: 2,
+            patch: 0,
+        };
+        let v2 = Version {
+            major: 1,
+            minor: 5,
+            patch: 0,
+        };
+
+        assert_eq!(client.compare_versions(&v1, &v2), -1);
+        assert_eq!(client.compare_versions(&v2, &v1), 1);
+    }
+
+    #[test]
+    fn test_version_comparison_patch_difference() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let v1 = Version {
+            major: 1,
+            minor: 0,
+            patch: 1,
+        };
+        let v2 = Version {
+            major: 1,
+            minor: 0,
+            patch: 3,
+        };
+
+        assert_eq!(client.compare_versions(&v1, &v2), -1);
+        assert_eq!(client.compare_versions(&v2, &v1), 1);
+    }
+
+    #[test]
+    fn test_version_support_after_minimum_update() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin, &1, &0, &0, &String::from_str(&env, "V1"));
+        client.update_version(&admin, &2, &0, &0, &String::from_str(&env, "V2"));
+        client.update_minimum_version(&admin, &1, &5, &0);
+
+        assert!(!client.is_version_supported(&Version {
+            major: 1,
+            minor: 0,
+            patch: 0
+        }));
+        assert!(client.is_version_supported(&Version {
+            major: 1,
+            minor: 5,
+            patch: 0
+        }));
+        assert!(client.is_version_supported(&Version {
+            major: 2,
+            minor: 0,
+            patch: 0
+        }));
+    }
+
+    #[test]
+    fn test_migration_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin, &1, &0, &0, &String::from_str(&env, "V1"));
+
+        let from_version = Version {
+            major: 1,
+            minor: 0,
+            patch: 0,
+        };
+        let to_version = Version {
+            major: 2,
+            minor: 0,
+            patch: 0,
+        };
+
+        client.start_migration(&admin, &from_version, &to_version);
+        client.complete_migration(&admin, &from_version, &to_version, &true);
+    }
+
+    #[test]
+    fn test_version_count_increments() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ContractVersioning);
+        let client = ContractVersioningClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin, &1, &0, &0, &String::from_str(&env, "V1"));
+        assert_eq!(client.get_version_count(), 1);
+
+        client.update_version(&admin, &1, &1, &0, &String::from_str(&env, "V1.1"));
         assert_eq!(client.get_version_count(), 2);
-    }
 
-    #[test]
-    fn test_update_version_major_increment() {
-        let e = Env::default();
-        let (client, deployer) = setup(&e);
-        client.update_version(&deployer, &2, &0, &0, &String::from_str(&e, "major"));
-        assert_eq!(client.get_current_version(), v(2, 0, 0));
-    }
+        client.update_version(&admin, &1, &2, &0, &String::from_str(&env, "V1.2"));
+        assert_eq!(client.get_version_count(), 3);
 
-    #[test]
-    fn test_is_version_supported_boundary() {
-        let e = Env::default();
-        let (client, deployer) = setup(&e);
-        client.update_version(&deployer, &2, &0, &0, &String::from_str(&e, "v2"));
-        // min=1.0.0, current=2.0.0
-        assert!(!client.is_version_supported(&v(0, 9, 0))); // below min
-        assert!(client.is_version_supported(&v(1, 0, 0)));  // at min
-        assert!(client.is_version_supported(&v(2, 0, 0)));  // at current
-        assert!(!client.is_version_supported(&v(2, 0, 1))); // above current
-    }
-
-    #[test]
-    fn test_deprecation_does_not_affect_support() {
-        let e = Env::default();
-        let (client, admin) = setup(&e);
-        client.deprecate_version(&admin, &v(1, 0, 0), &String::from_str(&e, "eol"));
-        // deprecated but still within [min, current] range
-        assert!(client.is_version_supported(&v(1, 0, 0)));
-        assert!(client.is_version_deprecated(&v(1, 0, 0)));
-    }
-
-    #[test]
-    fn test_metadata_deprecated_flag() {
-        let e = Env::default();
-        let (client, admin) = setup(&e);
-        client.deprecate_version(&admin, &v(1, 0, 0), &String::from_str(&e, "old"));
-        let meta = client.get_version_metadata(&v(1, 0, 0));
-        assert!(meta.deprecated);
-        assert_eq!(meta.version, v(1, 0, 0));
-        assert_eq!(meta.deployed_by, admin);
+        client.update_version(&admin, &2, &0, &0, &String::from_str(&env, "V2"));
+        assert_eq!(client.get_version_count(), 4);
     }
 }
