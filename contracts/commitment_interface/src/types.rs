@@ -57,33 +57,45 @@ pub struct Commitment {
     pub status: String,
 }
 
-/// Metadata associated with a commitment NFT.
+/// Event payload emitted by the live core contract when a commitment is created.
 ///
 /// # Security
-/// This mirrors the `CommitmentMetadata` stored in the `commitment_nft` contract.
+/// Consumers should treat this as observational data only. The authoritative
+/// state still lives in `get_commitment`, because later lifecycle transitions
+/// may change `current_value` or `status`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
-pub struct CommitmentMetadata {
+pub struct CommitmentCreatedEvent {
+    /// Unique on-chain identifier such as `c_0`.
     pub commitment_id: String,
-    pub duration_days: u32,
-    pub max_loss_percent: u32,
-    pub commitment_type: String, // "safe", "balanced", "aggressive"
-    pub created_at: u64,
-    pub expires_at: u64,
-    pub initial_amount: i128,
+    /// Commitment owner.
+    pub owner: Address,
+    /// Initial committed amount.
+    pub amount: i128,
+    /// Token contract address for the committed asset.
     pub asset_address: Address,
+    /// Associated NFT token id minted by `commitment_nft`.
+    pub nft_token_id: u32,
+    /// Policy and risk settings fixed at creation time.
+    pub rules: CommitmentRules,
+    /// Ledger timestamp when the event was emitted.
+    pub timestamp: u64,
 }
 
-/// The Commitment NFT structure.
+/// Event payload emitted by the live core contract when a commitment is settled.
 ///
 /// # Security
-/// This mirrors the `CommitmentNFT` stored in the `commitment_nft` contract.
+/// This payload reflects a completed state transition that also performs
+/// token/NFT cross-contract interactions in the live contract.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
-pub struct CommitmentNFT {
+pub struct CommitmentSettledEvent {
+    /// Unique on-chain identifier such as `c_0`.
+    pub commitment_id: String,
+    /// Commitment owner receiving the settlement.
     pub owner: Address,
-    pub token_id: u32,
-    pub metadata: CommitmentMetadata,
-    pub is_active: bool,
-    pub early_exit_penalty: u32,
+    /// Amount returned to the owner on settlement.
+    pub settlement_amount: i128,
+    /// Ledger timestamp when the event was emitted.
+    pub timestamp: u64,
 }
