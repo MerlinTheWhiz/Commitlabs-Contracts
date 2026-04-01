@@ -191,7 +191,7 @@ fn benchmark_get_owner_commitments() {
 
     e.as_contract(&contract_id, || {
         let start = e.ledger().sequence();
-        CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone());
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone(), 0, 50);
         let end = e.ledger().sequence();
         metrics.record_gas(start, end);
     });

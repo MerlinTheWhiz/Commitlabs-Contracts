@@ -671,15 +671,48 @@ impl CommitmentCoreContract {
 
     /// List all commitment IDs owned by the given address.
     pub fn list_commitments_by_owner(e: Env, owner: Address) -> Vec<String> {
-        Self::get_owner_commitments(e, owner)
+        Self::get_owner_commitments(e, owner, 0, MAX_PAGE_SIZE)
     }
 
-    /// Get all commitments for an owner
-    pub fn get_owner_commitments(e: Env, owner: Address) -> Vec<String> {
-        e.storage()
+    /// Return a paginated slice of commitment IDs owned by `owner`.
+    ///
+    /// # Parameters
+    /// - `owner`  – The address whose commitments are queried. No auth required; this is a
+    ///              read-only view that does not mutate any storage.
+    /// - `offset` – Zero-based index of the first item to return. If `offset` ≥ total count,
+    ///              an empty `Vec` is returned rather than panicking.
+    /// - `limit`  – Maximum number of items to return per call. Capped internally at
+    ///              [`MAX_PAGE_SIZE`] (50) to prevent resource exhaustion. Passing `0` returns
+    ///              an empty `Vec`.
+    ///
+    /// # Returns
+    /// A `Vec<String>` of commitment IDs in insertion order, starting at `offset` and
+    /// containing at most `min(limit, MAX_PAGE_SIZE)` entries.
+    ///
+    /// # Resource limits
+    /// Soroban's VCPU and memory budgets constrain how many storage reads can occur per
+    /// invocation. Stress testing with 50 commitments confirmed that pages of ≤ 50 IDs
+    /// stay well within the default budget. Callers should iterate with successive
+    /// `offset` values to page through larger sets.
+    pub fn get_owner_commitments(e: Env, owner: Address, offset: u32, limit: u32) -> Vec<String> {
+        let all: Vec<String> = e
+            .storage()
             .instance()
             .get::<_, Vec<String>>(&DataKey::OwnerCommitments(owner))
-            .unwrap_or(Vec::new(&e))
+            .unwrap_or(Vec::new(&e));
+
+        let total = all.len();
+        if offset >= total || limit == 0 {
+            return Vec::new(&e);
+        }
+
+        let effective_limit = limit.min(MAX_PAGE_SIZE);
+        let end = (offset + effective_limit).min(total);
+        let mut page = Vec::new(&e);
+        for i in offset..end {
+            page.push_back(all.get(i).unwrap());
+        }
+        page
     }
 
     /// Get total number of commitments

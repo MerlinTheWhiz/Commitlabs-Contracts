@@ -428,7 +428,7 @@ fn test_create_commitment_rolls_back_when_nft_mint_fails() {
     assert!(result.is_err());
     assert_eq!(client.get_total_commitments(), 0);
     assert_eq!(client.get_total_value_locked(), 0);
-    assert_eq!(client.get_owner_commitments(&owner).len(), 0);
+    assert_eq!(client.get_owner_commitments(&owner, &0u32, &50u32).len(), 0);
     assert_eq!(token_client.balance(&owner), amount * 2);
     assert_eq!(token_client.balance(&contract_id), 0);
 }
@@ -934,7 +934,7 @@ fn test_get_owner_commitments() {
 
     // Initially empty
     let commitments = e.as_contract(&contract_id, || {
-        CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone())
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone(), 0, 50)
     });
     assert_eq!(commitments.len(), 0);
 }
@@ -959,7 +959,7 @@ fn test_list_commitments_by_owner_matches_get_owner_commitments() {
     });
 
     let via_get = e.as_contract(&contract_id, || {
-        CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone())
+        CommitmentCoreContract::get_owner_commitments(e.clone(), owner.clone(), 0, 50)
     });
     let via_list = e.as_contract(&contract_id, || {
         CommitmentCoreContract::list_commitments_by_owner(e.clone(), owner.clone())
