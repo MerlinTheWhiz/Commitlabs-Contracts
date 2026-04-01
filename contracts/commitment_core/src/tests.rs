@@ -91,6 +91,50 @@ fn test_rules(e: &Env) -> CommitmentRules {
     }
 }
 
+fn setup_create_commitment_fixture(
+    e: &Env,
+    amount: i128,
+) -> (
+    Address,
+    CommitmentCoreContractClient<'_>,
+    Address,
+    Address,
+    Address,
+    TokenClient<'_>,
+    CommitmentRules,
+) {
+    e.mock_all_auths_allowing_non_root_auth();
+    e.ledger().with_mut(|ledger| {
+        ledger.timestamp = 1_700_000_000;
+    });
+
+    let contract_id = e.register_contract(None, CommitmentCoreContract);
+    let nft_contract = e.register_contract(None, MockNftContract);
+    let admin = Address::generate(e);
+    let owner = Address::generate(e);
+    let token_admin = Address::generate(e);
+
+    let token_contract = e.register_stellar_asset_contract_v2(token_admin);
+    let asset_address = token_contract.address();
+    let token_admin_client = StellarAssetClient::new(e, &asset_address);
+    token_admin_client.mint(&owner, &(amount * 2));
+
+    let client = CommitmentCoreContractClient::new(e, &contract_id);
+    client.initialize(&admin, &nft_contract);
+
+    let rules = test_rules(e);
+
+    (
+        contract_id,
+        client,
+        owner,
+        asset_address.clone(),
+        nft_contract,
+        TokenClient::new(e, &asset_address),
+        rules,
+    )
+}
+
 // Helper function to create a test commitment
 // ===============================
 // Boundary Tests for i128 Amounts
@@ -1076,7 +1120,6 @@ fn test_get_commitment_empty_id_returns_error() {
 }
 
 #[test]
-#[ignore = "Requires full NFT contract implementation"]
 fn test_get_commitment_returns_created_commitment_data() {
     let e = Env::default();
     e.mock_all_auths_allowing_non_root_auth();
@@ -1119,6 +1162,96 @@ fn test_get_commitment_returns_created_commitment_data() {
     assert_eq!(fetched.current_value, amount);
     assert_eq!(fetched.asset_address, asset_address);
     assert_eq!(fetched.status, String::from_str(&e, "active"));
+}
+
+#[test]
+fn test_create_commitment_updates_storage_layout() {
+    let e = Env::default();
+    let amount = 1_000i128;
+    let (contract_id, client, owner, asset_address, _nft_contract, token_client, rules) =
+        setup_create_commitment_fixture(&e, amount);
+
+    let created_id = client.create_commitment(&owner, &amount, &asset_address, &rules);
+    let commitment = client.get_commitment(&created_id);
+    let owner_commitments = client.get_owner_commitments(&owner);
+
+    let total_commitments = e.as_contract(&contract_id, || {
+        e.storage()
+            .instance()
+            .get::<_, u64>(&DataKey::TotalCommitments)
+            .unwrap()
+    });
+    let total_value_locked = e.as_contract(&contract_id, || {
+        e.storage()
+            .instance()
+            .get::<_, i128>(&DataKey::TotalValueLocked)
+            .unwrap()
+    });
+    let all_ids = e.as_contract(&contract_id, || {
+        e.storage()
+            .instance()
+            .get::<_, Vec<String>>(&DataKey::AllCommitmentIds)
+            .unwrap()
+    });
+
+    assert_eq!(created_id, String::from_str(&e, "c_0"));
+    assert_eq!(commitment.commitment_id, created_id);
+    assert_eq!(commitment.owner, owner);
+    assert_eq!(commitment.asset_address, asset_address.clone());
+    assert_eq!(commitment.amount, amount);
+    assert_eq!(commitment.current_value, amount);
+    assert_eq!(commitment.nft_token_id, 1);
+    assert_eq!(commitment.created_at, e.ledger().timestamp());
+    assert_eq!(
+        commitment.expires_at,
+        e.ledger().timestamp() + (rules.duration_days as u64 * 86400)
+    );
+    assert_eq!(commitment.status, String::from_str(&e, "active"));
+    assert_eq!(owner_commitments, vec![&e, created_id.clone()]);
+    assert_eq!(total_commitments, 1);
+    assert_eq!(total_value_locked, amount);
+    assert_eq!(all_ids, vec![&e, created_id.clone()]);
+    assert_eq!(client.get_collected_fees(&asset_address), 0);
+    assert_eq!(token_client.balance(&owner), amount);
+    assert_eq!(token_client.balance(&contract_id), amount);
+}
+
+#[test]
+fn test_create_commitment_validation_failures_do_not_mutate_storage() {
+    let e = Env::default();
+    let amount = 1_000i128;
+    let (contract_id, client, owner, asset_address, _nft_contract, token_client, _rules) =
+        setup_create_commitment_fixture(&e, amount);
+
+    let invalid_amount_result =
+        client.try_create_commitment(&owner, &0i128, &asset_address, &test_rules(&e));
+    assert!(invalid_amount_result.is_err());
+
+    let invalid_duration_rules = CommitmentRules {
+        duration_days: 0,
+        ..test_rules(&e)
+    };
+    let invalid_duration_result =
+        client.try_create_commitment(&owner, &amount, &asset_address, &invalid_duration_rules);
+    assert!(invalid_duration_result.is_err());
+
+    let invalid_type_rules = CommitmentRules {
+        commitment_type: String::from_str(&e, "invalid"),
+        ..test_rules(&e)
+    };
+    let invalid_type_result =
+        client.try_create_commitment(&owner, &amount, &asset_address, &invalid_type_rules);
+    assert!(invalid_type_result.is_err());
+
+    assert_eq!(client.get_total_commitments(), 0);
+    assert_eq!(client.get_total_value_locked(), 0);
+    assert_eq!(client.get_owner_commitments(&owner).len(), 0);
+    assert_eq!(
+        client.get_commitments_created_between(&0, &u64::MAX).len(),
+        0
+    );
+    assert_eq!(token_client.balance(&owner), amount * 2);
+    assert_eq!(token_client.balance(&contract_id), 0);
 }
 
 #[test]
@@ -1517,8 +1650,26 @@ fn test_create_commitment_event() {
     // `test_create_commitment_valid` calls `validate_rules` directly.
     // It seems `origin/master` avoids calling `create_commitment` because of dependencies.
 
-    // I will comment out this test for now to avoid breaking build, or try to mock it.
-    // But I should include the other event tests which are simpler (update_value, settle, etc).
+    let created_id = client.create_commitment(&owner, &amount, &asset_address, &rules);
+    let created_symbol = symbol_short!("Created").into_val(&e);
+    let events = e.events().all();
+    let created_event = events
+        .iter()
+        .find(|event| {
+            event.0 == contract_id
+                && event
+                    .1
+                    .first()
+                    .map_or(false, |topic| topic.shallow_eq(&created_symbol))
+        })
+        .expect("created event should be emitted");
+
+    assert_eq!(created_event.1.len(), 3);
+    assert!(created_event.1[1].shallow_eq(&created_id.clone().into_val(&e)));
+    assert!(created_event.1[2].shallow_eq(&owner.clone().into_val(&e)));
+    assert!(created_event
+        .2
+        .shallow_eq(&(amount, rules.clone(), 1u32, e.ledger().timestamp()).into_val(&e)));
 }
 
 #[test]
