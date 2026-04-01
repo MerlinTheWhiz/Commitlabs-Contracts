@@ -18,7 +18,8 @@ CommitLabs contracts implement commitment lifecycle management, NFT representati
 ### Commitment lifecycle
 1. `commitment_core::create_commitment` validates inputs, stores a commitment, transfers assets to the contract, and calls `commitment_nft::mint`.
 2. `commitment_nft::mint` persists metadata and ownership data for the NFT.
-3. `commitment_core::settle` and `commitment_core::early_exit` update commitment state, transfer assets, and call `commitment_nft::settle` for matured commitments.
+3. `commitment_core::settle` updates core state, returns assets, and calls `commitment_nft::settle`.
+4. `commitment_core::early_exit` updates core state, applies the penalty, returns the remaining assets, and calls `commitment_nft::mark_inactive`.
 
 ### Attestations
 1. `attestation_engine::attest` validates caller authorization and commitment existence.
@@ -55,3 +56,7 @@ flowchart LR
 - Deployment order: commitment_nft -> commitment_core -> attestation_engine.
 - allocation_logic is deployed independently.
 - Contract IDs are stored in `deployments/*.json` and referenced by downstream systems.
+
+## Cross-contract review reference
+- End-to-end threat review for `commitment_core <-> commitment_nft <-> attestation_engine`:
+  `docs/CORE_NFT_ATTESTATION_THREAT_REVIEW.md`

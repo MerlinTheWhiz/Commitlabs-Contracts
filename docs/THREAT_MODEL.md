@@ -5,6 +5,7 @@
 - NFT ownership and metadata in commitment_nft.
 - Attestation integrity and verifier authorization in attestation_engine.
 - Allocation records and pool liquidity totals in allocation_logic.
+- Price integrity and freshness in price_oracle.
 
 ## Actors
 - Commitment owners (users).
@@ -17,12 +18,14 @@
 - Cross-contract calls between commitment_core, commitment_nft, and attestation_engine.
 - Token contract transfer operations.
 - Admin-managed access control and verifier lists.
+- Admin-managed oracle whitelist in price_oracle.
 
 ## Entry points
 - commitment_core: create_commitment, settle, early_exit, allocate, update_value.
 - commitment_nft: mint, transfer, settle.
 - attestation_engine: attest, record_fees, record_drawdown.
 - allocation_logic: register_pool, allocate, rebalance.
+- price_oracle: add_oracle, remove_oracle, set_price, set_max_staleness, get_price_valid.
 
 ## Threats and mitigations
 
@@ -51,6 +54,12 @@
 - **Mitigations:** Checks-effects-interactions; transaction rollback on failure.
 - **Audit focus:** Ensure stored state is consistent if external calls revert.
 
+### Core / NFT / attestation call-graph drift
+- **Threat:** `commitment_core`, `commitment_nft`, and `attestation_engine` diverge on caller expectations, lifecycle semantics, or ABI shape, causing broken state mirroring or misleading compliance outputs.
+- **Mitigations:** Reentrancy guards, rollback-based atomicity assumptions, and canonical reads through `commitment_core::get_commitment`.
+- **Audit focus:** Verify outbound core-to-NFT calls are atomic on failure, verify NFT lifecycle writes are restricted to intended callers, and verify attestation reads fail closed when core data is unavailable or malformed.
+- **Reference:** `docs/CORE_NFT_ATTESTATION_THREAT_REVIEW.md`
+
 ### Storage growth/DoS
 - **Threat:** Unbounded vector growth may cause storage bloat or high gas costs.
 - **Mitigations:** None currently.
@@ -60,6 +69,13 @@
 - **Threat:** Malicious verifiers manipulate compliance score.
 - **Mitigations:** Verifier whitelist.
 - **Audit focus:** Multi-signer or quorum requirements if needed.
+
+### Price oracle manipulation resistance assumptions
+- **Threat:** A compromised or malicious whitelisted oracle publishes a manipulated price, or a delayed price remains usable long enough to distort downstream settlement or accounting.
+- **Mitigations:** Admin-managed oracle whitelist, `require_auth` on oracle/admin paths, non-negative price validation, and `get_price_valid` freshness checks that reject stale and future-dated prices.
+- **Assumptions:** `price_oracle` is a trusted-publisher registry, not an on-chain aggregation engine. It does not implement TWAP, medianization, quorum, circuit breakers, or cross-source reconciliation.
+- **Integrator responsibility:** Consumers must call `get_price_valid` with an appropriate staleness bound for the asset and use case; `get_price` is a raw read helper and does not enforce freshness.
+- **Audit focus:** Whether single-source trust is acceptable for each asset, whether admin key management around whitelist updates is strong enough, and whether downstream contracts choose staleness windows that match liquidation/settlement risk.
 
 ## Residual risks
 - Any missing auth checks or placeholder implementations can cause integrity issues.

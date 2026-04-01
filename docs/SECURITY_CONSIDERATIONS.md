@@ -32,6 +32,8 @@
 - commitment_core calls token contracts for transfers and commitment_nft for mint/settle.
 - attestation_engine invokes commitment_core to read commitments.
 - The commitment_core mint call does not include the `early_exit_penalty` parameter expected by commitment_nft::mint. This must be reconciled before audit.
+- The core/NFT/attestation call graph review is documented in `docs/CORE_NFT_ATTESTATION_THREAT_REVIEW.md`.
+- Reviewers should treat ABI drift and caller-identity drift across `commitment_core` and `commitment_nft` as high-severity risks because they directly affect asset custody and lifecycle consistency.
 
 ## Storage growth and data consistency
 - Vectors for owner commitments, attestations, pool registry, and token IDs grow without bounds; consider pagination or caps.
@@ -40,6 +42,11 @@
 ## Rate limiting
 - shared_utils RateLimiter is available and configurable by admin.
 - Rate limits are disabled until explicitly configured; audit should confirm desired defaults.
+
+## Timelock operations
+- `time_lock` requires admin authorization for queue and cancel operations.
+- `time_lock` execution is permissionless after the delay, which improves liveness but means operators must review queued actions before the execution window opens.
+- Delay selection should follow the operational guidance in `docs/TIMELOCK_RUNBOOK.md`.
 
 ## Event emission
 - Key state changes emit events (commitments created, allocations, attestations, mint/transfer/settle).
