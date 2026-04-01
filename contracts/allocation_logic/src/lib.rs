@@ -526,6 +526,35 @@ impl AllocationStrategiesContract {
         })
     }
 
+    /// Rebalances an existing allocation using the stored strategy.
+    ///
+    /// Reallocates the total committed amount across available pools according to the
+    /// strategy used in the original allocation. Useful for maintaining optimal
+    /// risk-adjusted returns as pool conditions change.
+    ///
+    /// **Preconditions:**
+    /// - Contract is initialized
+    /// - `caller` has authorized the transaction
+    /// - `reentrancy_guard == false`
+    /// - Allocation exists for `commitment_id`
+    /// - `caller` matches stored allocation owner
+    /// - Contract is not paused
+    ///
+    /// **Postconditions:**
+    /// - Allocation is updated with new pool assignments
+    /// - Total allocated amount remains unchanged
+    /// - Pool liquidity is correctly adjusted
+    /// - `reentrancy_guard == false`
+    ///
+    /// **Invariants Maintained:**
+    /// - INV-4: Reentrancy guard invariant
+    /// - Pool capacity never exceeded
+    ///
+    /// **Security Properties:**
+    /// - SP-1: Reentrancy protection
+    /// - SP-2: Rate limiting per caller
+    /// - SP-3: Arithmetic safety (overflow checks)
+    /// - SP-4: Ownership validation
     pub fn rebalance(
         env: Env,
         caller: Address,
