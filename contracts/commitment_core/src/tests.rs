@@ -604,10 +604,9 @@ fn test_create_commitment_expiration_overflow() {
         CommitmentCoreContract::initialize(e.clone(), admin.clone(), nft_contract.clone());
     });
 
-    // Set ledger timestamp so created_at + duration_days * 86400 overflows u64
-    e.ledger().with_mut(|l| {
-        l.timestamp = u64::MAX - 50_000;
-    });
+    // Advance the ledger so created_at + duration_days * 86400 overflows u64.
+    // duration_days = 1 → adds 86400 seconds.  u64::MAX - 86399 is the tipping point.
+    e.ledger().set_timestamp(u64::MAX - 86_399);
 
     let rules = CommitmentRules {
         duration_days: 1,
@@ -1869,6 +1868,7 @@ fn test_allocate_when_active_succeeds() {
     commitment.asset_address = asset_address;
     store_commitment(&e, &contract_id, &commitment);
 
+    // admin is authorized (is the admin address stored in the contract)
     client.allocate(
         &admin,
         &String::from_str(&e, commitment_id),

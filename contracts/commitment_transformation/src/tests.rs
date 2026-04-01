@@ -1,3 +1,23 @@
+//! Tests for `CommitmentTransformationContract`.
+//!
+//! Coverage goal: every [`TransformationError`] variant must be exercised at
+//! least once.  The matrix below tracks which test triggers which variant:
+//!
+//! | Variant | Discriminant | Test(s) |
+//! |---------|-------------|---------|
+//! | `InvalidAmount` | 1 | `test_error_invalid_amount_withdraw_zero`, `test_error_invalid_amount_withdraw_negative` |
+//! | `InvalidTrancheRatios` | 2 | `test_create_tranches_invalid_ratios`, `test_error_invalid_tranche_ratios_empty`, `test_error_invalid_tranche_ratios_length_mismatch` |
+//! | `InvalidFeeBps` | 3 | `test_error_invalid_fee_bps` |
+//! | `Unauthorized` | 4 | `test_create_tranches_unauthorized`, `test_error_unauthorized_set_fee` |
+//! | `NotInitialized` | 5 | `test_error_not_initialized_get_admin` |
+//! | `AlreadyInitialized` | 6 | `test_initialize_twice_fails` |
+//! | `CommitmentNotFound` | 7 | `test_all_error_messages` (message-level) |
+//! | `TransformationNotFound` | 8 | `test_error_transformation_not_found_tranche_set`, `…collateral`, `…instrument`, `…guarantee` |
+//! | `InvalidState` | 9 | `test_all_error_messages` (message-level) |
+//! | `ReentrancyDetected` | 10 | `test_all_error_messages` (message-level) |
+//! | `FeeRecipientNotSet` | 11 | `test_fee_withdraw_requires_recipient` |
+//! | `InsufficientFees` | 12 | `test_error_insufficient_fees` |
+
 #![cfg(test)]
 
 use super::*;

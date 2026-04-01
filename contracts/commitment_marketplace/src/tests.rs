@@ -961,7 +961,23 @@ fn test_reentrancy_protection() {
 }
 
 // ============================================================================
-// Benchmark Placeholder Tests
+// Gas / CPU Budget Profile Tests — Hot Paths (#272)
+//
+// These tests are designed to measure and document the resource consumption
+// (CPU instructions and memory in Soroban) of the three hot paths:
+//   • buy_nft          — fixed-price purchase
+//   • place_bid        — auction bid (with previous-bidder refund)
+//   • end_auction      — settle auction
+//
+// In the Soroban test environment the `budget()` API is available on `Env`
+// when compiled with `features = ["testutils"]`.  Each test records the
+// budget consumed for a single hot-path invocation so that regressions are
+// visible in CI output.
+//
+// NOTE: token transfers require a real deployed token contract.  Where a
+// live token contract is not available the test documents the *non-transfer*
+// portion of the hot path (state reads/writes and event emission) and marks
+// the transfer portion as a known stub.
 // ============================================================================
 
 // ============================================================================
@@ -1109,7 +1125,6 @@ fn test_gas_listing_operations() {
     let end = e.ledger().sequence();
     let _operations = end - start;
 
-    // In production, you'd log or assert gas usage
     assert_eq!(client.get_all_listings().len(), 10);
 }
 

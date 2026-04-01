@@ -42,6 +42,6 @@ fn test_nft_transfer_to_zero_address_fails() {
     // Setup: Mint to valid sender first
     client.mint(&sender, &token_id);
 
-    // Attempt transfer: (from, to, token_id)
+    let zero_address = generate_zero_address(&env);
     client.transfer(&sender, &zero_address, &token_id);
 }
