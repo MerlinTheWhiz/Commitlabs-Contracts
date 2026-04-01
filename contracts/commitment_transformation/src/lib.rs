@@ -36,10 +36,10 @@
 
 #![no_std]
 
-use shared_utils::{emit_error_event, Validation};
+use shared_utils::{emit_error_event, fees, Validation};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, String,
-    Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
+    IntoVal, String, Symbol, TryIntoVal, Val, Vec,
 };
 
 // ============================================================================
@@ -192,6 +192,32 @@ pub struct SecondaryInstrument {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct CoreCommitmentRules {
+    pub duration_days: u32,
+    pub max_loss_percent: u32,
+    pub commitment_type: String,
+    pub early_exit_penalty: u32,
+    pub min_fee_threshold: i128,
+    pub grace_period_days: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoreCommitment {
+    pub commitment_id: String,
+    pub owner: Address,
+    pub nft_token_id: u32,
+    pub rules: CoreCommitmentRules,
+    pub amount: i128,
+    pub asset_address: Address,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub current_value: i128,
+    pub status: String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtocolGuarantee {
     pub guarantee_id: String,
     pub commitment_id: String,
@@ -231,31 +257,70 @@ pub enum DataKey {
 
 fn require_admin(e: &Env, caller: &Address) {
     caller.require_auth();
-    let admin = e
-        .storage()
-        .instance()
-        .get::<_, Address>(&DataKey::Admin)
-        .unwrap_or_else(|| fail(e, TransformationError::NotInitialized, "require_admin"));
+    let admin = read_admin(e);
     if *caller != admin {
         fail(e, TransformationError::Unauthorized, "require_admin");
     }
 }
 
-fn require_authorized(e: &Env, caller: &Address) {
-    caller.require_auth();
-    let admin = e.storage().instance().get::<_, Address>(&DataKey::Admin);
-    let is_authorized = e
-        .storage()
+fn read_admin(e: &Env) -> Address {
+    e.storage()
+        .instance()
+        .get::<_, Address>(&DataKey::Admin)
+        .unwrap_or_else(|| fail(e, TransformationError::NotInitialized, "read_admin"))
+}
+
+fn read_core_contract(e: &Env) -> Address {
+    e.storage()
+        .instance()
+        .get::<_, Address>(&DataKey::CoreContract)
+        .unwrap_or_else(|| fail(e, TransformationError::NotInitialized, "read_core_contract"))
+}
+
+fn is_authorized_transformer_address(e: &Env, caller: &Address) -> bool {
+    e.storage()
         .instance()
         .get::<_, bool>(&DataKey::AuthorizedTransformer(caller.clone()))
-        .unwrap_or(false);
-    if let Some(a) = admin {
-        if *caller == a {
-            return;
-        }
+        .unwrap_or(false)
+}
+
+fn is_protocol_role(e: &Env, caller: &Address) -> bool {
+    *caller == read_admin(e) || is_authorized_transformer_address(e, caller)
+}
+
+fn load_commitment(e: &Env, commitment_id: &String) -> CoreCommitment {
+    let core_contract = read_core_contract(e);
+    let mut args = Vec::new(e);
+    args.push_back(commitment_id.clone().into_val(e));
+
+    let commitment_val: Val = match e.try_invoke_contract::<Val, soroban_sdk::Error>(
+        &core_contract,
+        &Symbol::new(e, "get_commitment"),
+        args,
+    ) {
+        Ok(Ok(val)) => val,
+        _ => fail(e, TransformationError::CommitmentNotFound, "load_commitment"),
+    };
+
+    commitment_val
+        .try_into_val(e)
+        .unwrap_or_else(|_| fail(e, TransformationError::CommitmentNotFound, "load_commitment"))
+}
+
+fn require_owner_or_protocol(e: &Env, caller: &Address, commitment_id: &String) -> CoreCommitment {
+    caller.require_auth();
+    let commitment = load_commitment(e, commitment_id);
+    if *caller == commitment.owner || is_protocol_role(e, caller) {
+        return commitment;
     }
-    if !is_authorized {
-        fail(e, TransformationError::Unauthorized, "require_authorized");
+
+    fail(e, TransformationError::Unauthorized, "require_owner_or_protocol");
+}
+
+fn require_protocol_role(e: &Env, caller: &Address) {
+    caller.require_auth();
+    if !is_protocol_role(e, caller) {
+        fail(e, TransformationError::Unauthorized, "require_protocol_role");
     }
 }
 
@@ -316,6 +381,7 @@ impl CommitmentTransformationContract {
         e.storage()
             .instance()
             .set(&DataKey::TransformationFeeBps, &0u32);
+        e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
         e.storage()
             .instance()
             .set(&DataKey::TrancheSetCounter, &0u64);
@@ -425,7 +491,7 @@ impl CommitmentTransformationContract {
         risk_levels: Vec<String>,
         fee_asset: Address,
     ) -> String {
-        require_authorized(&e, &caller);
+        let commitment = require_owner_or_protocol(&e, &caller, &commitment_id);
         require_no_reentrancy(&e);
         set_reentrancy_guard(&e, true);
 
@@ -440,7 +506,16 @@ impl CommitmentTransformationContract {
         }
         let mut sum_bps: u32 = 0;
         for bps in tranche_share_bps.iter() {
-            sum_bps = sum_bps.saturating_add(bps);
+            sum_bps = sum_bps
+                .checked_add(bps)
+                .unwrap_or_else(|| {
+                    set_reentrancy_guard(&e, false);
+                    fail(
+                        &e,
+                        TransformationError::InvalidTrancheRatios,
+                        "create_tranches",
+                    )
+                });
         }
         if sum_bps != 10000 {
             set_reentrancy_guard(&e, false);
@@ -456,7 +531,7 @@ impl CommitmentTransformationContract {
             .instance()
             .get::<_, u32>(&DataKey::TransformationFeeBps)
             .unwrap_or(0);
-        let fee_amount = (total_value * fee_bps as i128) / 10000i128;
+        let fee_amount = fees::fee_from_bps(total_value, fee_bps);
 
         // Collect transformation fee from caller when fee_bps > 0
         if fee_amount > 0 {
@@ -506,7 +581,7 @@ impl CommitmentTransformationContract {
         let set = TrancheSet {
             transformation_id: transformation_id.clone(),
             commitment_id: commitment_id.clone(),
-            owner: caller.clone(),
+            owner: commitment.owner.clone(),
             total_value,
             tranches: tranches.clone(),
             fee_paid: fee_amount,
@@ -565,7 +640,7 @@ impl CommitmentTransformationContract {
         collateral_amount: i128,
         asset_address: Address,
     ) -> String {
-        require_authorized(&e, &caller);
+        let commitment = require_owner_or_protocol(&e, &caller, &commitment_id);
         require_no_reentrancy(&e);
         set_reentrancy_guard(&e, true);
 
@@ -584,7 +659,7 @@ impl CommitmentTransformationContract {
         let collateral = CollateralizedAsset {
             asset_id: asset_id.clone(),
             commitment_id: commitment_id.clone(),
-            owner: caller.clone(),
+            owner: commitment.owner.clone(),
             collateral_amount,
             asset_address: asset_address.clone(),
             created_at: e.ledger().timestamp(),
@@ -642,7 +717,7 @@ impl CommitmentTransformationContract {
         instrument_type: String,
         amount: i128,
     ) -> String {
-        require_authorized(&e, &caller);
+        let commitment = require_owner_or_protocol(&e, &caller, &commitment_id);
         require_no_reentrancy(&e);
         set_reentrancy_guard(&e, true);
 
@@ -661,7 +736,7 @@ impl CommitmentTransformationContract {
         let instrument = SecondaryInstrument {
             instrument_id: instrument_id.clone(),
             commitment_id: commitment_id.clone(),
-            owner: caller.clone(),
+            owner: commitment.owner.clone(),
             instrument_type: instrument_type.clone(),
             amount,
             created_at: e.ledger().timestamp(),
@@ -719,7 +794,8 @@ impl CommitmentTransformationContract {
         guarantee_type: String,
         terms_hash: String,
     ) -> String {
-        require_authorized(&e, &caller);
+        require_protocol_role(&e, &caller);
+        load_commitment(&e, &commitment_id);
         require_no_reentrancy(&e);
         set_reentrancy_guard(&e, true);
 
@@ -869,12 +945,20 @@ impl CommitmentTransformationContract {
     }
 
     pub fn get_admin(e: Env) -> Address {
-        e.storage()
-            .instance()
-            .get::<_, Address>(&DataKey::Admin)
-            .unwrap_or_else(|| fail(&e, TransformationError::NotInitialized, "get_admin"))
+        read_admin(&e)
     }
 
+    /// Return the configured canonical core contract used for owner resolution.
+    pub fn get_core_contract(e: Env) -> Address {
+        read_core_contract(&e)
+    }
+
+    /// Return whether an address currently has the authorized transformer role.
+    pub fn is_authorized_transformer(e: Env, address: Address) -> bool {
+        is_authorized_transformer_address(&e, &address)
+    }
+
+    /// Return the configured transformation fee in basis points.
     pub fn get_transformation_fee_bps(e: Env) -> u32 {
         e.storage()
             .instance()
@@ -987,5 +1071,5 @@ fn format_tranformation_id(e: &Env, prefix: &str, n: u64) -> String {
     String::from_str(e, core::str::from_utf8(&buf[..i]).unwrap_or("t0"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
