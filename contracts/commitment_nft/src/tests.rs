@@ -62,6 +62,10 @@ fn setup_contract_with_core(e: &Env) -> (SdkAddress, CommitmentNFTContractClient
     (admin, client, core_id)
 }
 
+fn settle_as_core(client: &CommitmentNFTContractClient, token_id: &u32) {
+    client.settle(&client.get_core_contract(), token_id);
+}
+
 fn create_test_metadata(
     e: &Env,
     asset_address: &SdkAddress,
@@ -803,7 +807,7 @@ fn test_update_value_no_violation() {
             .instance()
             .set(&DataKey::TotalValueLocked, &1000i128);
     });
-    client.settle(&token_id);
+    settle_as_core(&client, &token_id);
     client.transfer(&owner, &recipient, &token_id);
     assert_eq!(client.balance_of(&owner), 0);
     assert_eq!(client.balance_of(&recipient), 1);
@@ -1154,7 +1158,7 @@ fn test_transfer_after_settlement() {
     });
 
     // Settle the NFT after expiry
-    client.settle(&token_id);
+    settle_as_core(&client, &token_id);
 
     // Verify NFT is now inactive (unlocked)
     assert_eq!(client.is_active(&token_id), false);
@@ -1385,8 +1389,8 @@ fn test_transfer_edge_cases_comprehensive() {
         li.timestamp = 172800; // 2 days
     });
     e.as_contract(&core_id, || {
-        client.settle(&token_id_1);
-        client.settle(&token_id_2);
+        settle_as_core(&client, &token_id_1);
+        settle_as_core(&client, &token_id_2);
     });
 
     // ===== Validation: Transfer token_id_1 from owner1 to owner2 =====
@@ -1516,7 +1520,7 @@ fn test_settle() {
     assert_eq!(client.is_expired(&token_id), true);
 
     // Settle the NFT after expiry
-    client.settle(&token_id);
+    settle_as_core(&client, &token_id);
 
     // NFT should now be inactive
     assert_eq!(client.is_active(&token_id), false);
@@ -1560,7 +1564,7 @@ fn test_settle_not_expired() {
     );
 
     // Try to settle before expiration, should fail with NotExpired
-    client.settle(&token_id);
+    settle_as_core(&client, &token_id);
 }
 
 #[test]
@@ -1588,8 +1592,8 @@ fn test_settle_already_settled() {
         li.timestamp = 172800;
     });
 
-    client.settle(&token_id);
-    client.settle(&token_id); // Should fail
+    settle_as_core(&client, &token_id);
+    settle_as_core(&client, &token_id); // Should fail
 }
 
 #[test]
@@ -1612,17 +1616,17 @@ fn test_settle_succeeds_after_expiry() {
     e.ledger().with_mut(|li| {
         li.timestamp = 172800;
     });
-    client.settle(&token_id);
+    settle_as_core(&client, &token_id);
     assert_eq!(client.is_active(&token_id), false);
 }
 
 #[test]
 fn test_settle_first_settle_marks_inactive() {
     let e = Env::default();
-    let (admin, client) = setup_contract(&e);
+    e.mock_all_auths();
+    let (_admin, client, _core_id) = setup_contract_with_core(&e);
     let owner = Address::generate(&e);
     let asset_address = Address::generate(&e);
-    client.initialize(&admin);
 
     let token_id = client.mint(
         &owner, // caller
@@ -1642,7 +1646,7 @@ fn test_settle_first_settle_marks_inactive() {
     assert_eq!(client.is_active(&token_id), true);
 
     // First settle: success
-    client.settle(&token_id);
+    settle_as_core(&client, &token_id);
 
     // Result state: inactive
     assert_eq!(client.is_active(&token_id), false);
@@ -1651,10 +1655,10 @@ fn test_settle_first_settle_marks_inactive() {
 #[test]
 fn test_settle_double_settle_returns_error() {
     let e = Env::default();
-    let (admin, client) = setup_contract(&e);
+    e.mock_all_auths();
+    let (_admin, client, _core_id) = setup_contract_with_core(&e);
     let owner = Address::generate(&e);
     let asset_address = Address::generate(&e);
-    client.initialize(&admin);
 
     let token_id = client.mint(
         &owner, // caller
@@ -1670,20 +1674,20 @@ fn test_settle_double_settle_returns_error() {
     e.ledger().with_mut(|li| li.timestamp = 172800);
 
     // First settle
-    client.settle(&token_id);
+    settle_as_core(&client, &token_id);
 
     // Second settle: should return ContractError::AlreadySettled (8)
-    let result = client.try_settle(&token_id);
+    let result = client.try_settle(&client.get_core_contract(), &token_id);
     assert!(result.is_err());
 }
 
 #[test]
 fn test_settle_consistency_after_double_settle() {
     let e = Env::default();
-    let (admin, client) = setup_contract(&e);
+    e.mock_all_auths();
+    let (_admin, client, _core_id) = setup_contract_with_core(&e);
     let owner = Address::generate(&e);
     let asset_address = Address::generate(&e);
-    client.initialize(&admin);
 
     let token_id = client.mint(
         &owner, // caller
@@ -1698,8 +1702,8 @@ fn test_settle_consistency_after_double_settle() {
     );
     e.ledger().with_mut(|li| li.timestamp = 172800);
 
-    client.settle(&token_id);
-    let _ = client.try_settle(&token_id); // Redundant settle
+    settle_as_core(&client, &token_id);
+    let _ = client.try_settle(&client.get_core_contract(), &token_id); // Redundant settle
 
     // State remains consistent
     assert_eq!(client.is_active(&token_id), false);
@@ -1713,10 +1717,10 @@ fn test_settle_consistency_after_double_settle() {
 #[test]
 fn test_settle_no_double_events() {
     let e = Env::default();
-    let (admin, client) = setup_contract(&e);
+    e.mock_all_auths();
+    let (_admin, client, _core_id) = setup_contract_with_core(&e);
     let owner = Address::generate(&e);
     let asset_address = Address::generate(&e);
-    client.initialize(&admin);
 
     let token_id = client.mint(
         &owner, // caller
@@ -1731,10 +1735,10 @@ fn test_settle_no_double_events() {
     );
     e.ledger().with_mut(|li| li.timestamp = 172800);
 
-    client.settle(&token_id);
+    settle_as_core(&client, &token_id);
     let events_after_first = e.events().all().len();
 
-    let _ = client.try_settle(&token_id); // Redundant settle
+    let _ = client.try_settle(&client.get_core_contract(), &token_id); // Redundant settle
     let events_after_second = e.events().all().len();
 
     // Verify no double events
@@ -2077,9 +2081,9 @@ fn test_balance_updates_after_transfer() {
     e.ledger().with_mut(|li| {
         li.timestamp = 172800; // 2 days
     });
-    client.settle(&0);
-    client.settle(&1);
-    client.settle(&2);
+    settle_as_core(&client, &0);
+    settle_as_core(&client, &1);
+    settle_as_core(&client, &2);
 
     // Transfer one NFT
     client.transfer(&owner1, &owner2, &0);
@@ -2180,7 +2184,7 @@ fn _test_unpause_restores_transfer() {
     e.ledger().with_mut(|li| {
         li.timestamp = 172800;
     });
-    client.settle(&token_id);
+    settle_as_core(&client, &token_id);
 
     client.pause();
     client.unpause();
@@ -2189,7 +2193,7 @@ fn _test_unpause_restores_transfer() {
     e.ledger().with_mut(|li| {
         li.timestamp += 31 * 86_400;
     });
-    client.settle(&token_id);
+    settle_as_core(&client, &token_id);
 
     client.transfer(&owner1, &owner2, &token_id);
     assert_eq!(client.owner_of(&token_id), owner2);
@@ -2299,9 +2303,7 @@ fn test_invariant_supply_unchanged_after_settle() {
 
     // Settle each — supply and balance must not change
     for token_id in [t0, t1, t2] {
-        e.as_contract(&core_id, || {
-            client.settle(&token_id);
-        });
+        settle_as_core(&client, &token_id);
         assert_eq!(client.total_supply(), supply_before);
         assert_eq!(client.balance_of(&owner), balance_before);
     }
@@ -2337,9 +2339,7 @@ fn test_invariant_balance_unchanged_after_settle_multi_owner() {
 
     // Partial settle: only a0, b0, b1
     for token_id in [a0, b0, b1] {
-        e.as_contract(&core_id, || {
-            client.settle(&token_id);
-        });
+        settle_as_core(&client, &token_id);
     }
 
     // All balances and supply unchanged
@@ -2375,9 +2375,7 @@ fn test_invariant_transfer_balance_conservation() {
     e.ledger().with_mut(|li| {
         li.timestamp = 172800;
     });
-    e.as_contract(&core_id, || {
-        client.settle(&t0);
-    });
+    settle_as_core(&client, &t0);
 
     let supply_before = client.total_supply();
     let from_bal_before = client.balance_of(&from);
@@ -2425,9 +2423,7 @@ fn test_invariant_complex_mint_settle_transfer_scenario() {
     });
 
     for token_id in [a0, a1, b0, c0] {
-        e.as_contract(&core_id, || {
-            client.settle(&token_id);
-        });
+        settle_as_core(&client, &token_id);
     }
 
     // INV-3: supply and balances unchanged
@@ -2457,9 +2453,7 @@ fn test_invariant_complex_mint_settle_transfer_scenario() {
 
     // --- Phase 4: Settle remaining active NFTs ---
     for token_id in [a2, b1] {
-        e.as_contract(&core_id, || {
-            client.settle(&token_id);
-        });
+        settle_as_core(&client, &token_id);
     }
     assert_eq!(client.total_supply(), 6);
     assert_balance_supply_invariant(&client, &owners);
@@ -2499,9 +2493,7 @@ fn test_invariant_transfer_chain_preserves_supply() {
     e.ledger().with_mut(|li| {
         li.timestamp = 172800;
     });
-    e.as_contract(&core_id, || {
-        client.settle(&token);
-    });
+    settle_as_core(&client, &token);
 
     // A -> B
     client.transfer(&a, &b, &token);
