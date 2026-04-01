@@ -122,6 +122,8 @@ pub enum DataKey {
     /// Owner tokens list (Address -> Vec<u32>)
     OwnerTokens(Address),
     /// List of all token IDs (Vec<u32>)
+    ///
+    /// Stored in persistent storage to avoid instance storage growth on hot paths.
     TokenIds,
     /// Authorized commitment_core contract address (for settlement)
     CoreContract,
@@ -165,9 +167,9 @@ impl CommitmentNFTContract {
         // Initialize token counter to 0
         e.storage().instance().set(&DataKey::TokenCounter, &0u32);
 
-        // Initialize empty token IDs vector
+        // Initialize empty token IDs vector (persistent storage for scalability)
         let token_ids: Vec<u32> = Vec::new(&e);
-        e.storage().instance().set(&DataKey::TokenIds, &token_ids);
+        e.storage().persistent().set(&DataKey::TokenIds, &token_ids);
 
         // Initialize paused state (default: not paused)
         e.storage()
@@ -473,9 +475,9 @@ impl CommitmentNFTContract {
         if !e.storage().instance().has(&DataKey::TokenCounter) {
             e.storage().instance().set(&DataKey::TokenCounter, &0u32);
         }
-        if !e.storage().instance().has(&DataKey::TokenIds) {
+        if !e.storage().persistent().has(&DataKey::TokenIds) {
             let token_ids: Vec<u32> = Vec::new(&e);
-            e.storage().instance().set(&DataKey::TokenIds, &token_ids);
+            e.storage().persistent().set(&DataKey::TokenIds, &token_ids);
         }
         if !e.storage().instance().has(&DataKey::ReentrancyGuard) {
             e.storage()
@@ -661,11 +663,11 @@ impl CommitmentNFTContract {
         // Add token_id to the list of all tokens
         let mut token_ids: Vec<u32> = e
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::TokenIds)
             .unwrap_or(Vec::new(&e));
         token_ids.push_back(token_id);
-        e.storage().instance().set(&DataKey::TokenIds, &token_ids);
+        e.storage().persistent().set(&DataKey::TokenIds, &token_ids);
 
         // Clear reentrancy guard
         e.storage()
@@ -724,11 +726,25 @@ impl CommitmentNFTContract {
         Ok(nft.owner)
     }
 
-    /// Transfer NFT to new owner
+    /// @notice Transfers the ownership of an NFT from one address to another.
+    /// @dev This function enforces "lock rules" where active commitments cannot be transferred.
     ///
-    /// # Reentrancy Protection
-    /// Uses checks-effects-interactions pattern. This function only writes to storage
-    /// and doesn't make external calls, but still protected for consistency.
+    /// @param from The current owner address (must authorize).
+    /// @param to The recipient address (cannot be zero or same as from).
+    /// @param token_id The unique identifier of the token.
+    ///
+    /// @return Result<(), ContractError>
+    ///
+    /// @error ContractError::TokenNotFound If the token does not exist.
+    /// @error ContractError::NotOwner If 'from' does not own the token.
+    /// @error ContractError::TransferToZeroAddress If 'to' is invalid (zero or self-transfer).
+    /// @error ContractError::NFTLocked If the commitment is still active.
+    ///
+    /// @security
+    /// - Requires auth from the 'from' address.
+    /// - Protected by reentrancy guard.
+    /// - Implements the Transfer State Machine:
+    ///   [docs/CONTRACT_FUNCTIONS.md#transfer-state-machine](../../../docs/CONTRACT_FUNCTIONS.md#transfer-state-machine)
     pub fn transfer(
         e: Env,
         from: Address,
@@ -891,10 +907,13 @@ impl CommitmentNFTContract {
     }
 
     /// Get all NFTs metadata (for frontend)
+    ///
+    /// Storage note: uses persistent `TokenIds` to avoid instance storage growth
+    /// on hot-path list operations.
     pub fn get_all_metadata(e: Env) -> Vec<CommitmentNFT> {
         let token_ids: Vec<u32> = e
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::TokenIds)
             .unwrap_or(Vec::new(&e));
 
