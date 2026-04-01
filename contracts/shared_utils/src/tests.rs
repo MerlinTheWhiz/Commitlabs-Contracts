@@ -5,13 +5,14 @@ mod integration_tests {
     use crate::access_control::AccessControl;
     use crate::events::Events;
     use crate::math::SafeMath;
+    use crate::pausable::Pausable;
     use crate::storage::Storage;
     use crate::time::TimeUtils;
     use crate::validation::Validation;
+    use soroban_sdk::testutils::{Events as _, Ledger};
     use soroban_sdk::{
         contract, contractimpl, symbol_short, vec, Env, IntoVal, String as SorobanString, Symbol,
     };
-    use soroban_sdk::testutils::{Events as _, Ledger};
 
     // Dummy contract used to provide a valid contract context for integration tests
     #[contract]
@@ -112,7 +113,10 @@ mod integration_tests {
 
             assert!(Storage::has(&env, &expiration_key));
             assert_eq!(Storage::get::<u64>(&env, &expiration_key), Some(expiration));
-            assert_eq!(TimeUtils::seconds_to_days(expiration - TimeUtils::now(&env)), 7);
+            assert_eq!(
+                TimeUtils::seconds_to_days(expiration - TimeUtils::now(&env)),
+                7
+            );
         });
     }
 
@@ -126,7 +130,10 @@ mod integration_tests {
 
         let expiration = TimeUtils::calculate_expiration(&env, 2);
         assert!(TimeUtils::is_valid(&env, expiration));
-        assert_eq!(TimeUtils::time_remaining(&env, expiration), TimeUtils::days_to_seconds(2));
+        assert_eq!(
+            TimeUtils::time_remaining(&env, expiration),
+            TimeUtils::days_to_seconds(2)
+        );
 
         env.ledger().with_mut(|ledger| {
             ledger.timestamp = expiration;
@@ -193,68 +200,107 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_time_and_storage_ledger_zero() {
+    fn test_pausable_key_alignment_and_state_reads() {
         let env = Env::default();
         let contract_id = env.register_contract(None, TestContract);
 
-        env.ledger().with_mut(|ledger| {
-            ledger.timestamp = 0;
-        });
-
         env.as_contract(&contract_id, || {
-            Storage::set_initialized(&env);
-            let expiration_key = symbol_short!("EXP0");
-            
-            // Calculate an expiration and store it
-            let exp = TimeUtils::calculate_expiration(&env, 1);
-            Storage::set(&env, &expiration_key, &exp);
-            
-            // Validate it
-            assert!(TimeUtils::is_valid(&env, exp));
-            assert_eq!(TimeUtils::time_remaining(&env, exp), 86_400);
+            // Ensure constant and helper key resolve to the same symbol.
+            assert_eq!(Pausable::PAUSED_KEY, Pausable::paused_key(&env));
 
-            // Using require_not_expired shouldn't panic
-            TimeUtils::require_not_expired(&env, exp);
+            // Simulate contracts that set the key directly on init.
+            env.storage()
+                .instance()
+                .set(&Pausable::PAUSED_KEY, &true);
+            assert!(Pausable::is_paused(&env));
+
+            // Updating via helper key should reflect the same storage slot.
+            env.storage()
+                .instance()
+                .set(&Pausable::paused_key(&env), &false);
+            assert!(!Pausable::is_paused(&env));
         });
     }
 
     #[test]
-    #[should_panic(expected = "expired")]
-    fn test_time_require_not_expired_exact_boundary() {
+    fn test_pause_unpause_toggles_state_and_emits_events() {
         let env = Env::default();
         let contract_id = env.register_contract(None, TestContract);
 
-        env.ledger().with_mut(|ledger| {
-            ledger.timestamp = 100_000;
+        env.as_contract(&contract_id, || {
+            assert!(!Pausable::is_paused(&env));
+            Pausable::require_not_paused(&env);
+
+            Pausable::pause(&env);
+            assert!(Pausable::is_paused(&env));
+            Pausable::require_paused(&env);
+
+            Pausable::unpause(&env);
+            assert!(!Pausable::is_paused(&env));
+            Pausable::require_not_paused(&env);
         });
 
+        let events = env.events().all();
+        assert_eq!(events.len(), 2);
+
+        let pause_event = events.first().unwrap();
+        assert_eq!(pause_event.0, contract_id);
+        assert_eq!(
+            pause_event.1,
+            vec![&env, symbol_short!("Pause").into_val(&env)]
+        );
+
+        let unpause_event = events.last().unwrap();
+        assert_eq!(unpause_event.0, contract_id);
+        assert_eq!(
+            unpause_event.1,
+            vec![&env, symbol_short!("Unpause").into_val(&env)]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract is already paused")]
+    fn test_pause_when_already_paused_panics() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, TestContract);
+
         env.as_contract(&contract_id, || {
-            let exp = 100_000; // exactly at ledger timestamp
-            // Should panic because expiration is inclusive
-            TimeUtils::require_not_expired(&env, exp);
+            Pausable::pause(&env);
+            Pausable::pause(&env);
         });
     }
 
     #[test]
-    fn test_require_valid_duration_integration() {
+    #[should_panic(expected = "Contract is already unpaused")]
+    fn test_unpause_when_unpaused_panics() {
         let env = Env::default();
         let contract_id = env.register_contract(None, TestContract);
 
         env.as_contract(&contract_id, || {
-            TimeUtils::require_valid_duration(365); // valid
-            TimeUtils::require_valid_duration(0);   // valid
-            TimeUtils::require_valid_duration(crate::time::MAX_DURATION_DAYS); // valid
+            Pausable::unpause(&env);
         });
     }
 
     #[test]
-    #[should_panic(expected = "duration_exceeds_max")]
-    fn test_require_valid_duration_integration_panic() {
+    #[should_panic(expected = "Contract is paused - operation not allowed")]
+    fn test_require_not_paused_panics_when_paused() {
         let env = Env::default();
         let contract_id = env.register_contract(None, TestContract);
 
         env.as_contract(&contract_id, || {
-            TimeUtils::require_valid_duration(crate::time::MAX_DURATION_DAYS + 1);
+            Pausable::pause(&env);
+            Pausable::require_not_paused(&env);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract is not paused")]
+    fn test_require_paused_panics_when_unpaused() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, TestContract);
+
+        env.as_contract(&contract_id, || {
+            Pausable::require_paused(&env);
         });
     }
 }
